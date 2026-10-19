@@ -1,0 +1,21 @@
+target:
+  backend: pgvector
+  resource: documents
+  schema_name: public
+  id_column: document_id
+  vector_column: embedding
+  metadata_columns: [category, rating]
+  index: documents_hnsw
+  connection_env: FANNAGENT_DATABASE_URL
+copy:
+  backup: /absolute/path/to/full-verified-backup
+  architecture: arm64
+  image: fannagent/pgvector:0.8.6-secure-v1
+  cpus: 4
+  memory_gib: 8
+model:
+  model: scripted
+  ceiling_usd: 1
+# Replace scripted with a provider/model and a verified versioned pricing contract.
+# Paid models additionally require input_usd_per_million, output_usd_per_million,
+# input_token_bound, output_token_limit, pricing_revision and bound_verified: true.

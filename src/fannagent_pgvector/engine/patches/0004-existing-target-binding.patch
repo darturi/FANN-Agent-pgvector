@@ -1,0 +1,225 @@
+--- a/src/fannbench.c
++++ b/src/fannbench.c
+@@ -10,6 +10,7 @@
+ #include "access/table.h"
+ #include "access/tableam.h"
+ #include "commands/defrem.h"
++#include "catalog/pg_am.h"
+ #include "common/int.h"
+ #include "executor/executor.h"
+ #include "fmgr.h"
+@@ -187,6 +188,12 @@
+ typedef void (*FannbenchScanQualHook) (ScanState *node, TupleTableSlot *slot,
+ 											bool passed);
+ extern PGDLLIMPORT FannbenchScanQualHook fannbench_scan_qual_hook;
++static char completedTrace[MAXPGPATH];
++static char completedNonce[FANNBENCH_NONCE_MAX];
++static Oid boundRelation = InvalidOid;
++static Oid boundIndex = InvalidOid;
++static AttrNumber boundId = InvalidAttrNumber;
++
+ static void TraceLine(const char *line, bool terminal);
+ static void RefreshTopKStats(void);
+ 
+@@ -227,7 +234,10 @@
+ 	executionState.hasExecutorFeedback = true;
+ 	/* A HOT update can change the visible tuple TID while retaining the root TID. */
+ 	candidate->pending = false;
+-	idAtt = get_attnum(indexScan->ss.ss_currentRelation->rd_id, "id");
++	if (OidIsValid(boundIndex) && RelationGetRelid(indexRelation) != boundIndex)
++        return;
++    idAtt = RelationGetRelid(indexScan->ss.ss_currentRelation) == boundRelation ?
++        boundId : get_attnum(indexScan->ss.ss_currentRelation->rd_id, "id");
+ 	if (idAtt != InvalidAttrNumber)
+ 	{
+ 		idDatum = slot_getattr(slot, idAtt, &idNull);
+@@ -312,6 +322,66 @@
+ 	}
+ }
+ 
++
++PG_FUNCTION_INFO_V1(fannagent_take_trace);
++Datum
++fannagent_take_trace(PG_FUNCTION_ARGS)
++{
++    char *nonce = text_to_cstring(PG_GETARG_TEXT_PP(0));
++    FILE *file;
++    long length;
++    char *data;
++    text *result;
++    if (strcmp(nonce, completedNonce) != 0 || completedTrace[0] == '\0')
++        ereport(ERROR, (errmsg("trace unavailable for this session nonce")));
++    file = fopen(completedTrace, "rb");
++    if (file == NULL || fseek(file, 0, SEEK_END) != 0)
++        ereport(ERROR, (errmsg("cannot read completed trace")));
++    length = ftell(file);
++    if (length < 0 || length > 64 * 1024 * 1024)
++        ereport(ERROR, (errmsg("invalid trace length")));
++    rewind(file);
++    data = palloc(length + 1);
++    if (fread(data, 1, length, file) != length)
++        ereport(ERROR, (errmsg("incomplete trace read")));
++    data[length] = '\0';
++    fclose(file);
++    (void) unlink(completedTrace);
++    completedTrace[0] = '\0';
++    result = cstring_to_text_with_len(data, length);
++    pfree(data);
++    pfree(nonce);
++    PG_RETURN_TEXT_P(result);
++}
++
++PG_FUNCTION_INFO_V1(fannagent_bind_target);
++Datum
++fannagent_bind_target(PG_FUNCTION_ARGS)
++{
++    Oid relationId = PG_GETARG_OID(0);
++    char *idName = text_to_cstring(PG_GETARG_TEXT_PP(1));
++    char *vectorName = text_to_cstring(PG_GETARG_TEXT_PP(2));
++    Oid indexId = PG_GETARG_OID(3);
++    Relation relation = table_open(relationId, AccessShareLock);
++    Relation index = index_open(indexId, AccessShareLock);
++    AttrNumber idAtt = get_attnum(relationId, idName);
++    AttrNumber vectorAtt = get_attnum(relationId, vectorName);
++    if (idAtt <= 0 || vectorAtt <= 0 ||
++        TupleDescAttr(RelationGetDescr(relation), idAtt - 1)->atttypid != INT8OID ||
++        index->rd_index->indrelid != relationId || index->rd_index->indnkeyatts != 1 ||
++        index->rd_index->indkey.values[0] != vectorAtt ||
++        index->rd_rel->relam != get_am_oid("hnsw", false))
++        ereport(ERROR, (errmsg("incompatible fannagent target binding")));
++    boundRelation = relationId;
++    boundIndex = indexId;
++    boundId = idAtt;
++    index_close(index, AccessShareLock);
++    table_close(relation, AccessShareLock);
++    pfree(idName);
++    pfree(vectorName);
++    PG_RETURN_OID(indexId);
++}
++
+ PG_FUNCTION_INFO_V1(fannbench_install_policy);
+ PG_FUNCTION_INFO_V1(fannbench_begin_execution);
+ PG_FUNCTION_INFO_V1(fannbench_observe_result);
+@@ -430,6 +500,7 @@
+ {
+ 	Relation heap;
+ 	TupleTableSlot *slot;
++    IndexFetchTableData *fetch;
+ 	AttrNumber idAtt;
+ 	StringInfoData line;
+ 	bool first = true;
+@@ -437,8 +508,10 @@
+ 	if (!FannbenchHnswAuditEnabled() || index == NULL)
+ 		return;
+ 	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+-	idAtt = get_attnum(RelationGetRelid(heap), "id");
++	idAtt = RelationGetRelid(heap) == boundRelation ? boundId :
++        get_attnum(RelationGetRelid(heap), "id");
+ 	slot = table_slot_create(heap, NULL);
++    fetch = table_index_fetch_begin(heap);
+ 	initStringInfo(&line);
+ 	appendStringInfo(&line,
+ 					 "{\"type\":\"audit_identity\",\"component_id\":\"%s\","
+@@ -448,22 +521,32 @@
+ 	{
+ 		Datum value;
+ 		bool isNull;
+-		if (idAtt == InvalidAttrNumber || !ItemPointerIsValid(&heaptids[i]) ||
+-			!table_tuple_fetch_row_version(heap, &heaptids[i], GetActiveSnapshot(), slot))
+-			continue;
+-		value = slot_getattr(slot, idAtt, &isNull);
++        bool callAgain = false;
++        bool allDead = false;
++        ItemPointerData visibleTid = heaptids[i];
++        if (idAtt == InvalidAttrNumber || !ItemPointerIsValid(&heaptids[i]))
++            continue;
++        do
++        {
++            if (!table_index_fetch_tuple(fetch, &visibleTid, GetActiveSnapshot(), slot,
++                                         &callAgain, &allDead))
++                continue;
++        value = slot_getattr(slot, idAtt, &isNull);
+ 		if (!isNull && TupleDescAttr(slot->tts_tupleDescriptor, idAtt - 1)->atttypid == INT8OID)
+ 		{
+ 			appendStringInfo(&line, "%s" INT64_FORMAT, first ? "" : ",",
+ 						 DatumGetInt64(value));
+ 			first = false;
+ 		}
+-		ExecClearTuple(slot);
+-	}
++        ExecClearTuple(slot);
++        } while (callAgain);
++        table_index_fetch_reset(fetch);
++    }
+ 	appendStringInfo(&line, "],\"heap_tuple_count\":%d}", count);
+ 	TraceLine(line.data, false);
+ 	pfree(line.data);
+-	ExecDropSingleTupleTableSlot(slot);
++	table_index_fetch_end(fetch);
++    ExecDropSingleTupleTableSlot(slot);
+ 	table_close(heap, AccessShareLock);
+ }
+ 
+@@ -1491,7 +1574,9 @@
+ 	StringInfoData event;
+ 	if (!executionState.active || strcmp(executionState.mode, "native") == 0)
+ 		return;
+-	entry = FindScan(scan, true);
++	if (OidIsValid(boundIndex) && RelationGetRelid(scan->indexRelation) != boundIndex)
++        ereport(ERROR, (errmsg("query used an HNSW index outside its target binding")));
++    entry = FindScan(scan, true);
+ 	if (entry == NULL)
+ 		return;
+ 	entry->generation++;
+@@ -1766,7 +1851,14 @@
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+ 				 errmsg("no active fannbench execution")));
+-	nonce = text_to_cstring(PG_GETARG_TEXT_PP(0));
++	if (PG_NARGS() == 2)
++    {
++        int32 count = PG_GETARG_INT32(1);
++        if (count < 0 || count > executionState.requestedK)
++            ereport(ERROR, (errmsg("invalid client completion count")));
++        executionState.returnedCount = count;
++    }
++    nonce = text_to_cstring(PG_GETARG_TEXT_PP(0));
+ 	if (strcmp(nonce, executionState.nonce) != 0)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+@@ -1904,8 +1996,15 @@
+ 					 executionState.registryHash, executionState.featureSetHash);
+ 	else
+ 		appendStringInfoString(&result, ",\"trace_descriptor\":null");
+-	appendStringInfoChar(&result, '}');
+-	ResetExecutionState();
++	appendStringInfo(&result,
++        ",\"returned_count\":%d,\"returned_count_source\":\"%s\","
++        "\"stop_scope\":\"hnsw_scan\",\"target_index_oid\":%u",
++        executionState.returnedCount, PG_NARGS() == 2 ? "client_reported" : "wrapper_observed",
++        boundIndex);
++    appendStringInfoChar(&result, '}');
++	strlcpy(completedTrace, executionState.tracePath, sizeof(completedTrace));
++    strlcpy(completedNonce, executionState.nonce, sizeof(completedNonce));
++    ResetExecutionState();
+ 	pfree(nonce);
+ 	PG_RETURN_TEXT_P(cstring_to_text(result.data));
+ }
+--- a/src/hnswutils.c
++++ b/src/hnswutils.c
+@@ -564,6 +564,15 @@
+ 			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
+ 	}
+ 
++    /* Development audit must include scored nodes rejected by the retained heap. */
++    if (FannbenchHnswAuditEnabled())
++    {
++        int visibleLength = 0;
++        while (visibleLength < HNSW_HEAPTIDS && ItemPointerIsValid(&etup->heaptids[visibleLength]))
++            visibleLength++;
++        FannbenchHnswAuditIdentity(index, blkno, offno, etup->heaptids, visibleLength);
++    }
++
+ 	/* Load element */
+ 	if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
+ 	{

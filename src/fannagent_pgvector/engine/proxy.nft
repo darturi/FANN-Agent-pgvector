@@ -1,0 +1,17 @@
+# The relay may initiate connections only to its private database endpoint.
+define database = @DATABASE_IP@
+table inet fannagent_proxy {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        tcp dport 5432 ct state { new, established } ct direction original accept
+        tcp sport 5432 ct state established ct direction reply ip saddr $database accept
+    }
+    chain output {
+        type filter hook output priority filter; policy drop;
+        tcp sport 5432 ct state established ct direction reply accept
+        tcp dport 5432 ct state { new, established } ct direction original ip daddr $database accept
+    }
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+}

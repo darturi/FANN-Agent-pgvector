@@ -1,0 +1,10 @@
+# Disposable integration-test source: stock PostgreSQL and unpatched pgvector.
+FROM fannagent/pgvector:0.8.6-secure-v1 AS build
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential postgresql-server-dev-17
+COPY source /tmp/vector
+RUN cd /tmp/vector && make OPTFLAGS="" && make install DESTDIR=/opt/install
+FROM postgres:17-trixie@sha256:f4c66b820c6f974249089d3d16d86a3698eae11e8746eb6644b2271031e91232
+COPY --from=build /opt/install/ /
+COPY source/LICENSE /usr/share/doc/pgvector/LICENSE
+LABEL io.fannagent.fixture="true"

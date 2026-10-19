@@ -1,0 +1,29 @@
+schema_version: 2
+research:
+  mode: guided
+backend:
+  name: pgvector
+  options:
+    target:
+      resource: documents
+      schema_name: public
+      id_column: id
+      vector_column: embedding
+      index: documents_hnsw
+      connection_env: FANNAGENT_DATABASE_URL
+    copy:
+      # Or replace replication_env with backup: /absolute/path/to/full-backup
+      replication_env: FANNAGENT_REPLICATION_URL
+      image: fannagent/pgvector:0.8.6-secure-v1
+      # Architecture is checked against the source and image automatically.
+resources:
+  cpus: 4
+  memory_gib: 8
+evidence:
+  max_bytes: 2147483648
+model:
+  model: scripted
+  ceiling_usd: 1
+workload:
+  count: 1000
+query_timeout_seconds: 30

@@ -1,0 +1,14 @@
+# IPv4 and IPv6: accept database requests and their replies only.
+table inet fannagent_copy {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        tcp dport 5432 ct state { new, established } ct direction original accept
+    }
+    chain output {
+        type filter hook output priority filter; policy drop;
+        tcp sport 5432 ct state established ct direction reply accept
+    }
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+}

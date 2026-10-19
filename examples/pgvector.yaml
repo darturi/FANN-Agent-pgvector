@@ -1,0 +1,30 @@
+schema_version: 2
+research:
+  mode: guided
+backend:
+  name: pgvector
+  options:
+    target:
+      resource: Documents
+      schema_name: agent fixture
+      id_column: Document Key
+      vector_column: Embedding Vector
+      index: Vectors HNSW
+      connection_env: FANNAGENT_DATABASE_URL
+    copy:
+      # Use backup: /absolute/full-backup instead for a supplied verified backup.
+      replication_env: FANNAGENT_REPLICATION_URL
+      image: fannagent/pgvector:0.8.6-secure-v1
+      architecture: arm64
+resources:
+  cpus: 4
+  memory_gib: 8
+evidence:
+  max_bytes: 2147483648
+  trace_max_bytes: 67108864
+model:
+  model: scripted
+  ceiling_usd: 1
+workload:
+  count: 1000
+query_timeout_seconds: 30

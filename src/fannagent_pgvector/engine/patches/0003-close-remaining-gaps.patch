@@ -1,0 +1,1029 @@
+diff --git a/sql/vector.sql b/sql/vector.sql
+index 095bcf4..db0d149 100644
+--- a/sql/vector.sql
++++ b/sql/vector.sql
+@@ -7,7 +7,7 @@ CREATE FUNCTION fannbench_install_policy(text, text) RETURNS text
+ 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+ 
+ CREATE FUNCTION fannbench_begin_execution(text, text, bigint, text, integer, integer,
+-	text, bigint, text, text, text) RETURNS text
++	text, bigint, text, text, text, boolean) RETURNS text
+ 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+ 
+ CREATE FUNCTION fannbench_observe_result() RETURNS boolean
+diff --git a/src/fannbench.c b/src/fannbench.c
+index 6b7c357..b418d70 100644
+--- a/src/fannbench.c
++++ b/src/fannbench.c
+@@ -3,8 +3,12 @@
+ #include <errno.h>
+ #include <math.h>
+ #include <sys/stat.h>
++#include <unistd.h>
+ 
+ #include "access/xact.h"
++#include "access/genam.h"
++#include "access/table.h"
++#include "access/tableam.h"
+ #include "commands/defrem.h"
+ #include "common/int.h"
+ #include "executor/executor.h"
+@@ -13,7 +17,9 @@
+ #include "miscadmin.h"
+ #include "portability/instr_time.h"
+ #include "utils/builtins.h"
++#include "utils/lsyscache.h"
+ #include "utils/rel.h"
++#include "utils/snapmgr.h"
+ 
+ #include "fannbench.h"
+ 
+@@ -26,6 +32,25 @@
+ #define FANNBENCH_MAX_INSTRUCTIONS 1024
+ #define FANNBENCH_MAX_STACK 512
+ #define FANNBENCH_QUEUE_STAT_COUNT 7
++#define FANNBENCH_MAX_SCANS 16
++
++typedef struct FannbenchTopKEntry
++{
++	int64 id;
++	double distance;
++} FannbenchTopKEntry;
++
++typedef struct FannbenchScanEntry
++{
++	IndexScanDesc scan;
++	int64 serial;
++	int64 generation;
++	bool pending;
++	ItemPointerData heapTid;
++	BlockNumber graphBlock;
++	OffsetNumber graphOffset;
++	double distance;
++} FannbenchScanEntry;
+ 
+ typedef enum FannbenchOpcode
+ {
+@@ -99,6 +124,31 @@ typedef struct FannbenchExecutionState
+ 	int64		adjacencyEntriesExamined;
+ 	int64		executorTuplePassCount;
+ 	int64		executorTupleFailCount;
++	int64		unattributedVectorEvaluations;
++	bool		insideGraphScorer;
++	bool		auditMembership;
++	bool		progressEnabled;
++	bool		hasExecutorFeedback;
++	FannbenchTopKEntry *topK;
++	int32		topKCount;
++	int64		topKInsertions;
++	int64		topKReplacements;
++	bool		previousTopKFull;
++	double		previousTopKWorst;
++	int64		traceSequence;
++	int64		lastObservationSequence;
++	FannbenchScanEntry scans[FANNBENCH_MAX_SCANS];
++	int64		nextScanSerial;
++	char		componentId[64];
++	int64		componentLayer0Start;
++	int64		componentUpperStart;
++	int64		componentUniqueStart;
++	int32		retainedCapacity;
++	int32		retainedCount;
++	bool		hasTopKStats;
++	double		topKStats[FANNBENCH_QUEUE_STAT_COUNT];
++	bool		hasWorstImprovement;
++	double		worstImprovement;
+ 	Oid			hnswAmOid;
+ 	int64		nextCheckpointTarget;
+ 	int64		lastCheckpointTarget;
+@@ -137,12 +187,21 @@ static bool installedPolicyV2;
+ typedef void (*FannbenchScanQualHook) (ScanState *node, TupleTableSlot *slot,
+ 											bool passed);
+ extern PGDLLIMPORT FannbenchScanQualHook fannbench_scan_qual_hook;
++static void TraceLine(const char *line, bool terminal);
++static void RefreshTopKStats(void);
+ 
+ static void
+ FannbenchScanQual(ScanState *node, TupleTableSlot *slot, bool passed)
+ {
+ 	IndexScanState *indexScan;
+ 	Relation indexRelation;
++	FannbenchScanEntry *candidate = NULL;
++	Datum idDatum;
++	bool idNull;
++	AttrNumber idAtt;
++	int64 logicalId = 0;
++	bool hasId = false;
++	StringInfoData observation;
+ 
+ 	if (!executionState.active || strcmp(executionState.mode, "native") == 0 ||
+ 		!executionState.hnswReached || executionState.hnswAmOid == InvalidOid ||
+@@ -152,10 +211,105 @@ FannbenchScanQual(ScanState *node, TupleTableSlot *slot, bool passed)
+ 	indexRelation = indexScan->iss_RelationDesc;
+ 	if (indexRelation == NULL || indexRelation->rd_rel->relam != executionState.hnswAmOid)
+ 		return;
++	for (int i = 0; i < FANNBENCH_MAX_SCANS; i++)
++		if (executionState.scans[i].scan == indexScan->iss_ScanDesc &&
++			executionState.scans[i].pending)
++		{
++			candidate = &executionState.scans[i];
++			break;
++		}
++	if (candidate == NULL)
++		return;
+ 	if (passed)
+ 		executionState.executorTuplePassCount++;
+ 	else
+ 		executionState.executorTupleFailCount++;
++	executionState.hasExecutorFeedback = true;
++	/* A HOT update can change the visible tuple TID while retaining the root TID. */
++	candidate->pending = false;
++	idAtt = get_attnum(indexScan->ss.ss_currentRelation->rd_id, "id");
++	if (idAtt != InvalidAttrNumber)
++	{
++		idDatum = slot_getattr(slot, idAtt, &idNull);
++		if (!idNull && TupleDescAttr(slot->tts_tupleDescriptor, idAtt - 1)->atttypid == INT8OID)
++		{
++			logicalId = DatumGetInt64(idDatum);
++			hasId = true;
++		}
++	}
++	if (passed && hasId && executionState.requestedK > 0)
++	{
++		int worst = -1;
++		for (int i = 0; i < executionState.topKCount; i++)
++		{
++			if (executionState.topK[i].id == logicalId)
++				goto trace_observation;
++			if (worst < 0 || executionState.topK[i].distance > executionState.topK[worst].distance ||
++				(executionState.topK[i].distance == executionState.topK[worst].distance &&
++				 executionState.topK[i].id > executionState.topK[worst].id))
++				worst = i;
++		}
++		if (executionState.topKCount < executionState.requestedK)
++		{
++			executionState.topK[executionState.topKCount].id = logicalId;
++			executionState.topK[executionState.topKCount].distance = 1.0 + candidate->distance;
++			executionState.topKCount++;
++			executionState.topKInsertions++;
++		}
++		else if (worst >= 0 &&
++			(1.0 + candidate->distance < executionState.topK[worst].distance ||
++			 (1.0 + candidate->distance == executionState.topK[worst].distance &&
++			  logicalId < executionState.topK[worst].id)))
++		{
++			executionState.topK[worst].id = logicalId;
++			executionState.topK[worst].distance = 1.0 + candidate->distance;
++			executionState.topKReplacements++;
++		}
++	}
++trace_observation:
++	if (executionState.traceFile == NULL ||
++		strcmp(executionState.traceLevel, "checkpoints") != 0)
++		return;
++	initStringInfo(&observation);
++	appendStringInfo(&observation,
++		"{\"type\":\"executor_observation\",\"component_id\":\"pgvector-scan-" INT64_FORMAT
++		"-" INT64_FORMAT "\",\"scan_serial\":" INT64_FORMAT
++		",\"rescan_generation\":" INT64_FORMAT
++		",\"graph_block\":%u,\"graph_offset\":%u,\"heap_block\":%u,\"heap_offset\":%u,"
++		"\"passed\":%s,\"distance\":%.17g,\"identity\":",
++		candidate->serial, candidate->generation, candidate->serial,
++		candidate->generation, candidate->graphBlock, candidate->graphOffset,
++		ItemPointerGetBlockNumber(&candidate->heapTid),
++		ItemPointerGetOffsetNumber(&candidate->heapTid),
++		passed ? "true" : "false", 1.0 + candidate->distance);
++	if (hasId)
++		appendStringInfo(&observation, "\"" INT64_FORMAT "\"", logicalId);
++	else
++		appendStringInfoString(&observation, "null");
++	appendStringInfoChar(&observation, '}');
++	TraceLine(observation.data, false);
++	executionState.lastObservationSequence = executionState.traceSequence;
++	pfree(observation.data);
++	if (executionState.auditMembership)
++	{
++		initStringInfo(&observation);
++		appendStringInfo(&observation,
++						 "{\"type\":\"audit_tuple_membership\",\"component_id\":\"pgvector-scan-" INT64_FORMAT
++						 "-" INT64_FORMAT "\",\"physical_id\":\"%u:%u\","
++						 "\"heap_tid\":\"%u:%u\",\"matched\":%s,\"logical_id\":",
++						 candidate->serial, candidate->generation,
++						 candidate->graphBlock, candidate->graphOffset,
++						 ItemPointerGetBlockNumber(&candidate->heapTid),
++						 ItemPointerGetOffsetNumber(&candidate->heapTid),
++						 passed ? "true" : "false");
++		if (hasId)
++			appendStringInfo(&observation, INT64_FORMAT, logicalId);
++		else
++			appendStringInfoString(&observation, "null");
++		appendStringInfoChar(&observation, '}');
++		TraceLine(observation.data, false);
++		pfree(observation.data);
++	}
+ }
+ 
+ PG_FUNCTION_INFO_V1(fannbench_install_policy);
+@@ -166,6 +320,8 @@ PG_FUNCTION_INFO_V1(fannbench_last_execution);
+ static void
+ ResetExecutionState(void)
+ {
++	if (executionState.topK != NULL)
++		pfree(executionState.topK);
+ 	if (executionState.traceFile != NULL)
+ 		fclose(executionState.traceFile);
+ 	if (executionState.tracePath[0] != '\0' && !executionState.traceComplete)
+@@ -174,26 +330,141 @@ ResetExecutionState(void)
+ }
+ 
+ static void
+-TraceLine(const char *line)
++TraceLine(const char *line, bool terminal)
+ {
+ 	Size length;
++	StringInfoData framed;
++	int64 limit;
+ 
+-	if (executionState.traceFile == NULL || executionState.traceTruncated)
++	if (executionState.traceFile == NULL ||
++		(executionState.traceTruncated && !terminal))
+ 		return;
+ 	length = strlen(line);
+-	if (executionState.traceBytes >= executionState.traceMaxBytes ||
+-		length >= (Size) (executionState.traceMaxBytes - executionState.traceBytes))
++	if (length == 0 || line[length - 1] != '}')
++	{
++		executionState.traceTruncated = true;
++		return;
++	}
++	initStringInfo(&framed);
++	appendStringInfo(&framed,
++					 "%.*s,\"sequence\":" INT64_FORMAT
++					 ",\"request_nonce\":\"%s\",\"feature_registry_hash\":\"%s\"}",
++					 (int) length - 1, line, executionState.traceSequence + 1,
++					 executionState.nonce, executionState.registryHash);
++	length = framed.len;
++	limit = executionState.traceMaxBytes;
++	if (!terminal)
++		limit -= Min((int64) 8192, executionState.traceMaxBytes / 4);
++	if (executionState.traceBytes + length + 1 > limit)
+ 	{
+ 		executionState.traceTruncated = true;
++		pfree(framed.data);
+ 		return;
+ 	}
+-	if (fwrite(line, 1, length, executionState.traceFile) != length ||
++	if (fwrite(framed.data, 1, length, executionState.traceFile) != length ||
+ 		fputc('\n', executionState.traceFile) == EOF)
+ 	{
+ 		executionState.traceTruncated = true;
++		pfree(framed.data);
+ 		return;
+ 	}
+ 	executionState.traceBytes += length + 1;
++	executionState.traceSequence++;
++	pfree(framed.data);
++}
++
++bool
++FannbenchHnswAuditEnabled(void)
++{
++	return executionState.active && executionState.auditMembership &&
++		executionState.traceFile != NULL && !executionState.traceTruncated &&
++		strcmp(executionState.mode, "native") != 0;
++}
++
++static void
++AuditGraphEvent(const char *type, BlockNumber block, OffsetNumber offset)
++{
++	StringInfoData line;
++
++	if (!FannbenchHnswAuditEnabled())
++		return;
++	initStringInfo(&line);
++	appendStringInfo(&line,
++					 "{\"type\":\"%s\",\"component_id\":\"%s\","
++					 "\"physical_id\":\"%u:%u\"}",
++					 type, executionState.componentId, block, offset);
++	TraceLine(line.data, false);
++	pfree(line.data);
++}
++
++void
++FannbenchHnswAuditDiscovery(BlockNumber block, OffsetNumber offset)
++{
++	AuditGraphEvent("audit_discovery", block, offset);
++}
++
++void
++FannbenchHnswAuditFrontier(BlockNumber block, OffsetNumber offset, bool inserted)
++{
++	AuditGraphEvent(inserted ? "audit_frontier_add" : "audit_frontier_remove",
++					block, offset);
++}
++
++void
++FannbenchHnswAuditFrontierReset(void)
++{
++	StringInfoData line;
++	if (!FannbenchHnswAuditEnabled())
++		return;
++	initStringInfo(&line);
++	appendStringInfo(&line,
++					 "{\"type\":\"audit_frontier_reset\",\"component_id\":\"%s\"}",
++					 executionState.componentId);
++	TraceLine(line.data, false);
++	pfree(line.data);
++}
++
++void
++FannbenchHnswAuditIdentity(Relation index, BlockNumber block,
++								OffsetNumber offset, ItemPointer heaptids, int count)
++{
++	Relation heap;
++	TupleTableSlot *slot;
++	AttrNumber idAtt;
++	StringInfoData line;
++	bool first = true;
++
++	if (!FannbenchHnswAuditEnabled() || index == NULL)
++		return;
++	heap = table_open(index->rd_index->indrelid, AccessShareLock);
++	idAtt = get_attnum(RelationGetRelid(heap), "id");
++	slot = table_slot_create(heap, NULL);
++	initStringInfo(&line);
++	appendStringInfo(&line,
++					 "{\"type\":\"audit_identity\",\"component_id\":\"%s\","
++					 "\"physical_id\":\"%u:%u\",\"logical_ids\":[",
++					 executionState.componentId, block, offset);
++	for (int i = 0; i < count; i++)
++	{
++		Datum value;
++		bool isNull;
++		if (idAtt == InvalidAttrNumber || !ItemPointerIsValid(&heaptids[i]) ||
++			!table_tuple_fetch_row_version(heap, &heaptids[i], GetActiveSnapshot(), slot))
++			continue;
++		value = slot_getattr(slot, idAtt, &isNull);
++		if (!isNull && TupleDescAttr(slot->tts_tupleDescriptor, idAtt - 1)->atttypid == INT8OID)
++		{
++			appendStringInfo(&line, "%s" INT64_FORMAT, first ? "" : ",",
++						 DatumGetInt64(value));
++			first = false;
++		}
++		ExecClearTuple(slot);
++	}
++	appendStringInfo(&line, "],\"heap_tuple_count\":%d}", count);
++	TraceLine(line.data, false);
++	pfree(line.data);
++	ExecDropSingleTupleTableSlot(slot);
++	table_close(heap, AccessShareLock);
+ }
+ 
+ static void
+@@ -208,7 +479,8 @@ TraceCheckpoint(const char *decision)
+ 					 "{\"type\":\"checkpoint\",\"index\":" INT64_FORMAT
+ 					 ",\"target\":" INT64_FORMAT
+ 					 ",\"actual_layer0_distances\":" INT64_FORMAT
+-					 ",\"component_id\":\"pgvector-layer0\","
++					 ",\"observation_watermark\":" INT64_FORMAT
++					 ",\"component_id\":\"%s\","
+ 					 "\"route\":\"postgresql_pgvector_hnsw\","
+ 					 "\"features\":{"
+ 					 "\"k\":%d,"
+@@ -227,6 +499,8 @@ TraceCheckpoint(const char *decision)
+ 					 executionState.checkpointCount,
+ 					 executionState.lastCheckpointTarget,
+ 					 executionState.distanceEvaluations,
++					 executionState.lastObservationSequence,
++					 executionState.componentId[0] ? executionState.componentId : "pgvector-layer0",
+ 					 executionState.requestedK,
+ 					 executionState.predicateLeafCount,
+ 					 executionState.checkpointCount,
+@@ -246,6 +520,38 @@ TraceCheckpoint(const char *decision)
+ 					 ",\"executor_tuple_fail_count\":" INT64_FORMAT,
+ 					 executionState.executorTuplePassCount,
+ 					 executionState.executorTupleFailCount);
++	appendStringInfo(&line,
++					 ",\"component_layer0_distance_evaluations\":" INT64_FORMAT
++					 ",\"component_upper_distance_evaluations\":" INT64_FORMAT
++					 ",\"component_unique_discoveries\":" INT64_FORMAT
++					 ",\"unattributed_vector_evaluations\":" INT64_FORMAT
++					 ",\"retained_result_count\":%d,\"retained_result_capacity\":%d",
++					 executionState.distanceEvaluations - executionState.componentLayer0Start,
++					 executionState.upperDistanceEvaluations - executionState.componentUpperStart,
++					 executionState.uniqueDiscoveries - executionState.componentUniqueStart,
++					 executionState.unattributedVectorEvaluations,
++					 executionState.retainedCount, executionState.retainedCapacity);
++	if (executionState.hasExecutorFeedback)
++	{
++		appendStringInfo(&line,
++						 ",\"qualified_topk_count\":%d,\"recent_topk_insertions\":" INT64_FORMAT
++						 ",\"recent_topk_replacements\":" INT64_FORMAT,
++						 executionState.topKCount, executionState.topKInsertions,
++						 executionState.topKReplacements);
++		if (executionState.hasTopKStats)
++			appendStringInfo(&line,
++						 ",\"qualified_topk_distance_min\":%.17g,\"qualified_topk_distance_max\":%.17g,"
++						 "\"qualified_topk_distance_mean\":%.17g,\"qualified_topk_distance_variance\":%.17g,"
++						 "\"qualified_topk_distance_p25\":%.17g,\"qualified_topk_distance_p50\":%.17g,"
++						 "\"qualified_topk_distance_p75\":%.17g",
++						 executionState.topKStats[0], executionState.topKStats[1],
++						 executionState.topKStats[2], executionState.topKStats[3],
++						 executionState.topKStats[4], executionState.topKStats[5],
++						 executionState.topKStats[6]);
++		if (executionState.hasWorstImprovement)
++			appendStringInfo(&line, ",\"worst_topk_distance_improvement\":%.17g",
++							 executionState.worstImprovement);
++	}
+ 	if (executionState.hasEntryDistance)
+ 		appendStringInfo(&line, ",\"entry_distance\":%.17g",
+ 					 executionState.entryDistance);
+@@ -272,7 +578,7 @@ TraceCheckpoint(const char *decision)
+ 						 executionState.frontierStats[6]);
+ 	}
+ 	appendStringInfo(&line, "},\"decision\":\"%s\"}", decision);
+-	TraceLine(line.data);
++	TraceLine(line.data, false);
+ 	pfree(line.data);
+ }
+ 
+@@ -316,6 +622,10 @@ KnownFeature(const char *name)
+ 		"recent_distance_improvement", "recent_result_improvement",
+ 		"frontier_best_distance", "checkpoint_target", "checkpoint_overshoot",
+ 		"layer0_distance_evaluations", "layer0_distance_since_checkpoint",
++		"component_layer0_distance_evaluations", "component_upper_distance_evaluations",
++		"component_unique_discoveries",
++		"unattributed_vector_evaluations",
++		"retained_result_count", "retained_result_capacity",
+ 		"queue_pops", "executor_tuple_pass_count", "executor_tuple_fail_count",
+ 		"frontier_count", "frontier_distance_min",
+ 		"upper_distance_evaluations", "exact_distance_evaluations",
+@@ -612,6 +922,9 @@ fannbench_begin_execution(PG_FUNCTION_ARGS)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+ 				 errmsg("requested k must be positive and predicate count nonnegative")));
++	executionState.topK = MemoryContextAllocZero(TopMemoryContext,
++									 sizeof(FannbenchTopKEntry) * executionState.requestedK);
++	executionState.auditMembership = PG_NARGS() > 11 && !PG_ARGISNULL(11) && PG_GETARG_BOOL(11);
+ 	executionState.active = true;
+ 
+ 	PG_RETURN_TEXT_P(cstring_to_text(executionState.nonce));
+@@ -688,6 +1001,70 @@ FeatureValue(const char *name, const FannbenchFeatures *features)
+ 		value.type = FANNBENCH_VALUE_INT;
+ 		value.intValue = executionState.upperDistanceEvaluations;
+ 	}
++	else if (installedPolicyV2 && strcmp(name, "component_layer0_distance_evaluations") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = executionState.distanceEvaluations - executionState.componentLayer0Start;
++	}
++	else if (installedPolicyV2 && strcmp(name, "component_upper_distance_evaluations") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = executionState.upperDistanceEvaluations - executionState.componentUpperStart;
++	}
++	else if (installedPolicyV2 && strcmp(name, "component_unique_discoveries") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = executionState.uniqueDiscoveries - executionState.componentUniqueStart;
++	}
++	else if (installedPolicyV2 && strcmp(name, "unattributed_vector_evaluations") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = executionState.unattributedVectorEvaluations;
++	}
++	else if (installedPolicyV2 && strcmp(name, "retained_result_count") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = executionState.retainedCount;
++	}
++	else if (installedPolicyV2 && strcmp(name, "retained_result_capacity") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = executionState.retainedCapacity;
++	}
++	else if (installedPolicyV2 && executionState.hasExecutorFeedback &&
++			(strcmp(name, "qualified_topk_count") == 0 ||
++			 strcmp(name, "recent_topk_insertions") == 0 ||
++			 strcmp(name, "recent_topk_replacements") == 0))
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = strcmp(name, "qualified_topk_count") == 0 ? executionState.topKCount :
++			strcmp(name, "recent_topk_insertions") == 0 ? executionState.topKInsertions :
++			executionState.topKReplacements;
++	}
++	else if (installedPolicyV2 && executionState.hasWorstImprovement &&
++			 strcmp(name, "worst_topk_distance_improvement") == 0)
++	{
++		value.type = FANNBENCH_VALUE_FLOAT;
++		value.floatValue = executionState.worstImprovement;
++	}
++	else if (installedPolicyV2 && executionState.hasTopKStats &&
++			 strncmp(name, "qualified_topk_distance_", 24) == 0)
++	{
++		static const char *const names[FANNBENCH_QUEUE_STAT_COUNT] = {
++			"qualified_topk_distance_min", "qualified_topk_distance_max",
++			"qualified_topk_distance_mean", "qualified_topk_distance_variance",
++			"qualified_topk_distance_p25", "qualified_topk_distance_p50",
++			"qualified_topk_distance_p75"
++		};
++		value.type = FANNBENCH_UNAVAILABLE;
++		for (int i = 0; i < FANNBENCH_QUEUE_STAT_COUNT; i++)
++			if (strcmp(name, names[i]) == 0)
++			{
++				value.type = FANNBENCH_VALUE_FLOAT;
++				value.floatValue = executionState.topKStats[i];
++				break;
++			}
++	}
+ 	else if (installedPolicyV2 && strcmp(name, "layer0_distance_since_checkpoint") == 0)
+ 	{
+ 		value.type = FANNBENCH_VALUE_INT;
+@@ -1052,6 +1429,135 @@ FannbenchHnswLayer0EntryDistance(void)
+ 		executionState.distanceEvaluations++;
+ }
+ 
++void
++FannbenchHnswLayerScore(int level)
++{
++	if (!executionState.active || strcmp(executionState.mode, "native") == 0)
++		return;
++	if (level == 0)
++		executionState.distanceEvaluations++;
++	else
++		executionState.upperDistanceEvaluations++;
++}
++
++void
++FannbenchHnswScoring(bool inside)
++{
++	if (executionState.active)
++		executionState.insideGraphScorer = inside;
++}
++
++void
++FannbenchVectorDistanceComputed(void)
++{
++	if (executionState.active && strcmp(executionState.mode, "native") != 0 &&
++		!executionState.insideGraphScorer)
++		executionState.unattributedVectorEvaluations++;
++}
++
++void
++FannbenchHnswRetained(int count, int capacity)
++{
++	if (executionState.active && strcmp(executionState.mode, "native") != 0)
++	{
++		executionState.retainedCount = count;
++		executionState.retainedCapacity = capacity;
++	}
++}
++
++static FannbenchScanEntry *
++FindScan(IndexScanDesc scan, bool create)
++{
++	FannbenchScanEntry *freeEntry = NULL;
++
++	for (int i = 0; i < FANNBENCH_MAX_SCANS; i++)
++	{
++		if (executionState.scans[i].scan == scan)
++			return &executionState.scans[i];
++		if (freeEntry == NULL && executionState.scans[i].scan == NULL)
++			freeEntry = &executionState.scans[i];
++	}
++	if (!create || freeEntry == NULL)
++		return NULL;
++	freeEntry->scan = scan;
++	freeEntry->serial = ++executionState.nextScanSerial;
++	return freeEntry;
++}
++
++void
++FannbenchHnswScanReset(IndexScanDesc scan)
++{
++	FannbenchScanEntry *entry;
++	StringInfoData event;
++	if (!executionState.active || strcmp(executionState.mode, "native") == 0)
++		return;
++	entry = FindScan(scan, true);
++	if (entry == NULL)
++		return;
++	entry->generation++;
++	entry->pending = false;
++	snprintf(executionState.componentId, sizeof(executionState.componentId),
++			 "pgvector-scan-" INT64_FORMAT "-" INT64_FORMAT,
++			 entry->serial, entry->generation);
++	executionState.topKCount = 0;
++	executionState.topKInsertions = 0;
++	executionState.topKReplacements = 0;
++	executionState.previousTopKFull = false;
++	executionState.hasExecutorFeedback = false;
++	executionState.componentLayer0Start = executionState.distanceEvaluations;
++	executionState.componentUpperStart = executionState.upperDistanceEvaluations;
++	executionState.componentUniqueStart = executionState.uniqueDiscoveries;
++	if (executionState.traceFile != NULL)
++	{
++		initStringInfo(&event);
++		appendStringInfo(&event,
++					 "{\"type\":\"component_start\",\"component_id\":\"%s\","
++					 "\"route\":\"postgresql_pgvector_hnsw\",\"scan_serial\":" INT64_FORMAT
++					 ",\"rescan_generation\":" INT64_FORMAT "}",
++					 executionState.componentId, entry->serial, entry->generation);
++		TraceLine(event.data, false);
++		pfree(event.data);
++	}
++}
++
++void
++FannbenchHnswScanEnded(IndexScanDesc scan)
++{
++	FannbenchScanEntry *entry = FindScan(scan, false);
++	if (entry != NULL)
++	{
++		if (executionState.traceFile != NULL)
++		{
++			StringInfoData event;
++			initStringInfo(&event);
++			appendStringInfo(&event,
++						 "{\"type\":\"component_end\",\"component_id\":\"pgvector-scan-" INT64_FORMAT
++						 "-" INT64_FORMAT "\",\"route\":\"postgresql_pgvector_hnsw\"}",
++						 entry->serial, entry->generation);
++			TraceLine(event.data, false);
++			pfree(event.data);
++		}
++		entry->scan = NULL;
++	}
++}
++
++void
++FannbenchHnswCandidateReturned(IndexScanDesc scan, BlockNumber block,
++								 OffsetNumber offset, ItemPointer heapTid, double distance)
++{
++	FannbenchScanEntry *entry;
++	if (!executionState.active || strcmp(executionState.mode, "native") == 0)
++		return;
++	entry = FindScan(scan, true);
++	if (entry == NULL)
++		return;
++	entry->pending = true;
++	entry->heapTid = *heapTid;
++	entry->graphBlock = block;
++	entry->graphOffset = offset;
++	entry->distance = distance;
++}
++
+ bool
+ FannbenchHnswQueueSnapshotNeeded(int64 upcomingDistances)
+ {
+@@ -1081,6 +1587,54 @@ QueuePercentile(const double *values, int count, double fraction)
+ 	return values[lower] + (position - lower) * (values[upper] - values[lower]);
+ }
+ 
++static void
++RefreshTopKStats(void)
++{
++	double *distances;
++	double mean = 0;
++	double variance = 0;
++
++	executionState.hasTopKStats = false;
++	executionState.hasWorstImprovement = false;
++	if (executionState.topKCount == 0)
++		return;
++	distances = palloc(sizeof(double) * executionState.topKCount);
++	for (int i = 0; i < executionState.topKCount; i++)
++	{
++		distances[i] = executionState.topK[i].distance;
++		mean += distances[i];
++	}
++	mean /= executionState.topKCount;
++	for (int i = 0; i < executionState.topKCount; i++)
++	{
++		double delta = distances[i] - mean;
++		variance += delta * delta;
++	}
++	variance /= executionState.topKCount;
++	qsort(distances, executionState.topKCount, sizeof(double), CompareQueueDistance);
++	executionState.topKStats[0] = distances[0];
++	executionState.topKStats[1] = distances[executionState.topKCount - 1];
++	executionState.topKStats[2] = mean;
++	executionState.topKStats[3] = variance;
++	for (int i = 4; i < FANNBENCH_QUEUE_STAT_COUNT; i++)
++		executionState.topKStats[i] = QueuePercentile(distances,
++									 executionState.topKCount, (i - 3) * 0.25);
++	executionState.hasTopKStats = true;
++	if (executionState.topKCount == executionState.requestedK)
++	{
++		if (executionState.previousTopKFull)
++		{
++			executionState.hasWorstImprovement = true;
++			executionState.worstImprovement = executionState.previousTopKWorst - executionState.topKStats[1];
++		}
++		executionState.previousTopKFull = true;
++		executionState.previousTopKWorst = executionState.topKStats[1];
++	}
++	else
++		executionState.previousTopKFull = false;
++	pfree(distances);
++}
++
+ void
+ FannbenchHnswSetFrontierDistances(double *distances, int count,
+ 									int64 traversalNanos)
+@@ -1144,7 +1698,6 @@ FannbenchHnswObserveDistances(int64 count, int64 frontierCount,
+ 	if (strcmp(executionState.mode, "native") == 0)
+ 		return false;
+ 	executionState.completedExpansions++;
+-	executionState.distanceEvaluations += count;
+ 	executionState.uniqueDiscoveries += count;
+ 	executionState.frontierCount = frontierCount;
+ 	executionState.hasFrontier = hasFrontier;
+@@ -1158,6 +1711,7 @@ FannbenchHnswObserveDistances(int64 count, int64 frontierCount,
+ 		instr_time	elapsed;
+ 
+ 		executionState.checkpointCount++;
++		RefreshTopKStats();
+ 		executionState.lastCheckpointTarget = executionState.nextCheckpointTarget;
+ 		executionState.nextCheckpointTarget =
+ 		(executionState.distanceEvaluations / FANNBENCH_CHECKPOINT_INTERVAL + 1)
+@@ -1190,6 +1744,8 @@ FannbenchHnswObserveDistances(int64 count, int64 frontierCount,
+ 			executionState.fixedBudgetStopped ? "fixed_budget" :
+ 			strcmp(executionState.mode, "policy_noop") == 0 ? "noop" : "continue");
+ 		executionState.distanceAtLastCheckpoint = executionState.distanceEvaluations;
++		executionState.topKInsertions = 0;
++		executionState.topKReplacements = 0;
+ 	}
+ 	return executionState.fixedBudgetStopped || executionState.policyStopped;
+ }
+@@ -1241,11 +1797,13 @@ fannbench_last_execution(PG_FUNCTION_ARGS)
+ 					 "\"stop_reason\":\"%s\","
+ 					 "\"layer0_distance_evaluations\":" INT64_FORMAT ","
+ 					 "\"upper_distance_evaluations\":" INT64_FORMAT ","
++					 "\"unattributed_vector_evaluations\":" INT64_FORMAT ","
+ 					 "\"executor_tuple_pass_count\":" INT64_FORMAT ","
+ 					 "\"executor_tuple_fail_count\":" INT64_FORMAT ","
+ 					 "\"work_at_stop\":",
+ 					 path, stopReason, executionState.distanceEvaluations,
+ 					 executionState.upperDistanceEvaluations,
++					 executionState.unattributedVectorEvaluations,
+ 					 executionState.executorTuplePassCount,
+ 					 executionState.executorTupleFailCount);
+ 		if (executionState.policyStopped || executionState.fixedBudgetStopped)
+@@ -1265,7 +1823,7 @@ fannbench_last_execution(PG_FUNCTION_ARGS)
+ 			appendStringInfoString(&terminal,
+ 						 ",\"finalization_work\":null,"
+ 						 "\"finalization_work_reason\":\"no_early_stop\"}");
+-		TraceLine(terminal.data);
++		TraceLine(terminal.data, true);
+ 		pfree(terminal.data);
+ 		if (fclose(executionState.traceFile) != 0)
+ 			executionState.traceTruncated = true;
+@@ -1275,7 +1833,7 @@ fannbench_last_execution(PG_FUNCTION_ARGS)
+ 
+ 	initStringInfo(&result);
+ 	appendStringInfo(&result,
+-					 "{\"protocol\":\"same_execution_v3\","
++					 "{\"protocol\":\"same_execution_v4\","
+ 					 "\"request_nonce\":\"%s\",\"effective_mode\":\"%s\","
+ 					 "\"policy_hash\":",
+ 					 executionState.nonce, executionState.mode);
+@@ -1303,6 +1861,7 @@ fannbench_last_execution(PG_FUNCTION_ARGS)
+ 						 INT64_FORMAT ",\"work_counters\":{"
+ 						 "\"layer0_distance_evaluations\":" INT64_FORMAT ","
+ 						 "\"upper_distance_evaluations\":" INT64_FORMAT ","
++						 "\"unattributed_vector_evaluations\":" INT64_FORMAT ","
+ 						 "\"completed_expansions\":" INT64_FORMAT ","
+ 						 "\"unique_discoveries\":" INT64_FORMAT ","
+ 						 "\"queue_pops\":" INT64_FORMAT ","
+@@ -1316,6 +1875,7 @@ fannbench_last_execution(PG_FUNCTION_ARGS)
+ 						 executionState.checkpointCount,
+ 						 executionState.distanceEvaluations,
+ 						 executionState.upperDistanceEvaluations,
++						 executionState.unattributedVectorEvaluations,
+ 						 executionState.completedExpansions,
+ 						 executionState.uniqueDiscoveries,
+ 						 executionState.queuePops,
+diff --git a/src/fannbench.h b/src/fannbench.h
+index 9904c96..2e72021 100644
+--- a/src/fannbench.h
++++ b/src/fannbench.h
+@@ -2,6 +2,7 @@
+ #define FANNBENCH_H
+ 
+ #include "postgres.h"
++#include "access/genam.h"
+ 
+ void		FannbenchInit(void);
+ void		FannbenchHnswRouteReached(void);
+@@ -10,6 +11,21 @@ void		FannbenchHnswQueuePop(void);
+ void		FannbenchHnswAdjacencyExamined(void);
+ void		FannbenchHnswUpperDistance(int64 count);
+ void		FannbenchHnswLayer0EntryDistance(void);
++void		FannbenchHnswLayerScore(int level);
++void		FannbenchHnswScoring(bool inside);
++void		FannbenchVectorDistanceComputed(void);
++void		FannbenchHnswRetained(int count, int capacity);
++bool		FannbenchHnswAuditEnabled(void);
++void		FannbenchHnswAuditDiscovery(BlockNumber block, OffsetNumber offset);
++void		FannbenchHnswAuditFrontier(BlockNumber block, OffsetNumber offset, bool inserted);
++void		FannbenchHnswAuditFrontierReset(void);
++void		FannbenchHnswAuditIdentity(Relation index, BlockNumber block,
++										 OffsetNumber offset, ItemPointer heaptids, int count);
++void		FannbenchHnswScanReset(IndexScanDesc scan);
++void		FannbenchHnswScanEnded(IndexScanDesc scan);
++void		FannbenchHnswCandidateReturned(IndexScanDesc scan, BlockNumber block,
++										 OffsetNumber offset, ItemPointer heapTid,
++										 double distance);
+ bool		FannbenchHnswQueueSnapshotNeeded(int64 upcomingDistances);
+ void		FannbenchHnswSetFrontierDistances(double *distances, int count,
+ 									 int64 traversalNanos);
+diff --git a/src/hnswscan.c b/src/hnswscan.c
+index ba7df6c..6929550 100644
+--- a/src/hnswscan.c
++++ b/src/hnswscan.c
+@@ -169,6 +169,7 @@ void
+ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys)
+ {
+ 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
++	FannbenchHnswScanReset(scan);
+ 
+ 	so->first = true;
+ 	/* v and discarded are allocated in tmpCtx */
+@@ -323,6 +324,8 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+ 		MemoryContextSwitchTo(oldCtx);
+ 
+ 		scan->xs_heaptid = *heaptid;
++		FannbenchHnswCandidateReturned(scan, element->blkno, element->offno,
++									 heaptid, sc->distance);
+ 		scan->xs_recheck = false;
+ 		scan->xs_recheckorderby = false;
+ 		return true;
+@@ -339,6 +342,7 @@ void
+ hnswendscan(IndexScanDesc scan)
+ {
+ 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
++	FannbenchHnswScanEnded(scan);
+ 
+ 	MemoryContextDelete(so->tmpCtx);
+ 
+diff --git a/src/hnswutils.c b/src/hnswutils.c
+index e4d7c73..8470ad5 100644
+--- a/src/hnswutils.c
++++ b/src/hnswutils.c
+@@ -526,7 +526,11 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
+ static inline double
+ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
+ {
+-	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
++	double distance;
++	FannbenchHnswScoring(true);
++	distance = DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
++	FannbenchHnswScoring(false);
++	return distance;
+ }
+ 
+ /*
+@@ -618,10 +622,8 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation i
+ 		distance = GetElementDistance(base, entryPoint, q, support);
+ 	else
+ 		HnswLoadElement(entryPoint, &distance, q, index, support, loadVec, NULL);
+-	if (entryPoint->level > 0)
+-		FannbenchHnswUpperDistance(1);
+-	else
+-		FannbenchHnswLayer0EntryDistance();
++	if (DatumGetPointer(q->value) != NULL)
++		FannbenchHnswLayerScore(entryPoint->level);
+ 
+ 	return HnswInitSearchCandidate(base, entryPoint, distance);
+ }
+@@ -880,9 +882,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(lm);
+ 		localNeighborhood = palloc(neighborhoodSize);
+ 	}
++	if (lc == 0 && !inserting && index != NULL)
++		FannbenchHnswAuditFrontierReset();
+ 
+ 	/* Add entry points to v, C, and W */
+-	if (lc == 0 && !inserting && ep != NIL)
++	if (lc == 0 && !inserting && initVisited && ep != NIL)
+ 		FannbenchHnswLayerStart(list_length(ep),
+ 			((HnswSearchCandidate *) linitial(ep))->distance);
+ 	foreach(lc2, ep)
+@@ -898,6 +902,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 			if (tuples != NULL)
+ 				(*tuples)++;
+ 		}
++		if (lc == 0 && !inserting && index != NULL)
++		{
++			HnswElement auditElement = HnswPtrAccess(base, sc->element);
++			if (initVisited)
++			{
++				FannbenchHnswAuditDiscovery(auditElement->blkno, auditElement->offno);
++				FannbenchHnswAuditIdentity(index, auditElement->blkno,
++										 auditElement->offno, auditElement->heaptids,
++										 auditElement->heaptidsLength);
++			}
++			FannbenchHnswAuditFrontier(auditElement->blkno, auditElement->offno, true);
++		}
+ 
+ 		pairingheap_add(C, &sc->c_node);
+ 		cCount++;
+@@ -919,7 +935,14 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 		HnswElement cElement;
+ 		cCount--;
+ 		if (lc == 0 && !inserting)
++		{
+ 			FannbenchHnswQueuePop();
++			if (index != NULL)
++			{
++				HnswElement auditElement = HnswPtrAccess(base, c->element);
++				FannbenchHnswAuditFrontier(auditElement->blkno, auditElement->offno, false);
++			}
++		}
+ 
+ 		if (c->distance > f->distance)
+ 			break;
+@@ -941,6 +964,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 			HnswSearchCandidate *e;
+ 			double		eDistance;
+ 			bool		alwaysAdd = wlen < ef;
++			BlockNumber auditBlock = InvalidBlockNumber;
++			OffsetNumber auditOffset = InvalidOffsetNumber;
++
++			if (lc == 0 && !inserting && index != NULL)
++			{
++				auditBlock = ItemPointerGetBlockNumber(&unvisited[i].indextid);
++				auditOffset = ItemPointerGetOffsetNumber(&unvisited[i].indextid);
++				FannbenchHnswAuditDiscovery(auditBlock, auditOffset);
++			}
+ 
+ 			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+ 
+@@ -958,10 +990,14 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 				/* Avoid any allocations if not adding */
+ 				eElement = NULL;
+ 				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+-
+-				if (eElement == NULL)
+-					continue;
+ 			}
++			if (!inserting && DatumGetPointer(q->value) != NULL)
++				FannbenchHnswLayerScore(lc);
++			if (eElement == NULL)
++				continue;
++			if (auditBlock != InvalidBlockNumber)
++				FannbenchHnswAuditIdentity(index, auditBlock, auditOffset,
++										 eElement->heaptids, eElement->heaptidsLength);
+ 
+ 			if (!(eDistance < f->distance || alwaysAdd))
+ 			{
+@@ -982,6 +1018,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 			/* Create a new candidate */
+ 			e = HnswInitSearchCandidate(base, eElement, eDistance);
+ 			pairingheap_add(C, &e->c_node);
++			if (auditBlock != InvalidBlockNumber)
++				FannbenchHnswAuditFrontier(auditBlock, auditOffset, true);
+ 			cCount++;
+ 			pairingheap_add(W, &e->w_node);
+ 
+@@ -1005,10 +1043,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 			}
+ 		}
+ 
+-		if (lc > 0 && !inserting)
+-			FannbenchHnswUpperDistance(unvisitedLength);
+ 		if (lc == 0 && !inserting &&
+-			FannbenchHnswQueueSnapshotNeeded(unvisitedLength))
++			FannbenchHnswQueueSnapshotNeeded(0))
+ 		{
+ 			double	   *distances;
+ 			int			written = 0;
+@@ -1026,6 +1062,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 			if (distances != NULL)
+ 				pfree(distances);
+ 		}
++		if (lc == 0 && !inserting)
++			FannbenchHnswRetained(wlen, ef);
+ 		if (lc == 0 && !inserting &&
+ 			FannbenchHnswObserveDistances(unvisitedLength,
+ 				cCount,
+diff --git a/src/vector.c b/src/vector.c
+index 9177816..e6a2f59 100644
+--- a/src/vector.c
++++ b/src/vector.c
+@@ -644,6 +644,7 @@ vector_negative_inner_product(PG_FUNCTION_ARGS)
+ 	Vector	   *b = PG_GETARG_VECTOR_P(1);
+ 
+ 	CheckDims(a, b);
++	FannbenchVectorDistanceComputed();
+ 
+ 	PG_RETURN_FLOAT8((double) -VectorInnerProduct(a->dim, a->x, b->x));
+ }
+@@ -679,6 +680,7 @@ cosine_distance(PG_FUNCTION_ARGS)
+ 	double		similarity;
+ 
+ 	CheckDims(a, b);
++	FannbenchVectorDistanceComputed();
+ 
+ 	similarity = VectorCosineSimilarity(a->dim, a->x, b->x);
+ 

@@ -1,0 +1,76 @@
+diff --git a/src/backend/executor/execScan.c b/src/backend/executor/execScan.c
+index 8a3485d..0d7c43a 100644
+--- a/src/backend/executor/execScan.c
++++ b/src/backend/executor/execScan.c
+@@ -21,6 +21,7 @@
+ #include "executor/executor.h"
+ #include "miscadmin.h"
+ 
++FannbenchScanQualHook fannbench_scan_qual_hook = NULL;
+ 
+ 
+ /*
+@@ -184,8 +185,13 @@ ExecScan(ScanState *node,
+ 	 */
+ 	if (!qual && !projInfo)
+ 	{
++		TupleTableSlot *slot;
++
+ 		ResetExprContext(econtext);
+-		return ExecScanFetch(node, accessMtd, recheckMtd);
++		slot = ExecScanFetch(node, accessMtd, recheckMtd);
++		if (fannbench_scan_qual_hook != NULL && !TupIsNull(slot))
++			fannbench_scan_qual_hook(node, slot, true);
++		return slot;
+ 	}
+ 
+ 	/*
+@@ -201,6 +207,7 @@ ExecScan(ScanState *node,
+ 	for (;;)
+ 	{
+ 		TupleTableSlot *slot;
++		bool passed;
+ 
+ 		slot = ExecScanFetch(node, accessMtd, recheckMtd);
+ 
+@@ -230,7 +237,11 @@ ExecScan(ScanState *node,
+ 		 * when the qual is null ... saves only a few cycles, but they add up
+ 		 * ...
+ 		 */
+-		if (qual == NULL || ExecQual(qual, econtext))
++		passed = qual == NULL || ExecQual(qual, econtext);
++
++		if (fannbench_scan_qual_hook != NULL)
++			fannbench_scan_qual_hook(node, slot, passed);
++		if (passed)
+ 		{
+ 			/*
+ 			 * Found a satisfactory scan tuple.
+diff --git a/src/include/executor/executor.h b/src/include/executor/executor.h
+index 6cecfbc..d7f41d5 100644
+--- a/src/include/executor/executor.h
++++ b/src/include/executor/executor.h
+@@ -476,6 +476,10 @@ extern Datum ExecMakeFunctionResultSet(SetExprState *fcache,
+  */
+ typedef TupleTableSlot *(*ExecScanAccessMtd) (ScanState *node);
+ typedef bool (*ExecScanRecheckMtd) (ScanState *node, TupleTableSlot *slot);
++/* FANNBench's optional callback observes the result of the existing scan qual. */
++typedef void (*FannbenchScanQualHook) (ScanState *node, TupleTableSlot *slot,
++											bool passed);
++extern PGDLLIMPORT FannbenchScanQualHook fannbench_scan_qual_hook;
+ 
+ extern TupleTableSlot *ExecScan(ScanState *node, ExecScanAccessMtd accessMtd,
+ 								ExecScanRecheckMtd recheckMtd);
+diff --git a/src/include/pg_config_manual.h b/src/include/pg_config_manual.h
+index f941ee2..96a8f2c 100644
+--- a/src/include/pg_config_manual.h
++++ b/src/include/pg_config_manual.h
+@@ -206,7 +206,7 @@
+  * support them yet.
+  */
+ #ifndef WIN32
+-#define DEFAULT_PGSOCKET_DIR  "/tmp"
++#define DEFAULT_PGSOCKET_DIR  "/var/run/postgresql"
+ #else
+ #define DEFAULT_PGSOCKET_DIR ""
+ #endif

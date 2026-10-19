@@ -1,0 +1,968 @@
+diff --git a/Makefile b/Makefile
+index 7e2c8c3..1f10ed2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -4,7 +4,7 @@ EXTVERSION = 0.8.6
+ MODULE_big = vector
+ DATA = $(wildcard sql/*--*--*.sql)
+ DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
+-OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
++OBJS = src/bitutils.o src/bitvec.o src/fannbench.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
+ HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
+ 
+ TESTS = $(wildcard test/sql/*.sql)
+diff --git a/sql/vector.sql b/sql/vector.sql
+index 7fc3671..c37c451 100644
+--- a/sql/vector.sql
++++ b/sql/vector.sql
+@@ -1,6 +1,20 @@
+ -- complain if script is sourced in psql, rather than via CREATE EXTENSION
+ \echo Use "CREATE EXTENSION vector" to load this file. \quit
+ 
++-- FANNBench same-execution observability protocol
++
++CREATE FUNCTION fannbench_install_policy(text, text) RETURNS text
++	AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
++
++CREATE FUNCTION fannbench_begin_execution(text, text, bigint, text, integer, integer) RETURNS text
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
++
++CREATE FUNCTION fannbench_observe_result() RETURNS boolean
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
++
++CREATE FUNCTION fannbench_last_execution(text) RETURNS text
++	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
++
+ -- vector type
+ 
+ CREATE TYPE vector;
+diff --git a/src/fannbench.c b/src/fannbench.c
+new file mode 100644
+index 0000000..44e78a4
+--- /dev/null
++++ b/src/fannbench.c
+@@ -0,0 +1,846 @@
++#include "postgres.h"
++
++#include <errno.h>
++#include <math.h>
++
++#include "access/xact.h"
++#include "common/int.h"
++#include "fmgr.h"
++#include "lib/stringinfo.h"
++#include "portability/instr_time.h"
++#include "utils/builtins.h"
++
++#include "fannbench.h"
++
++#define FANNBENCH_MODE_MAX 32
++#define FANNBENCH_NONCE_MAX 80
++#define FANNBENCH_HASH_MAX 96
++#define FANNBENCH_ERROR_MAX 160
++#define FANNBENCH_ARGUMENT_MAX 64
++#define FANNBENCH_CHECKPOINT_INTERVAL 64
++#define FANNBENCH_MAX_INSTRUCTIONS 1024
++#define FANNBENCH_MAX_STACK 512
++
++typedef enum FannbenchOpcode
++{
++	FANNBENCH_FEATURE,
++	FANNBENCH_INT,
++	FANNBENCH_FLOAT,
++	FANNBENCH_BOOL,
++	FANNBENCH_OP,
++	FANNBENCH_JIF,
++	FANNBENCH_RETURN
++} FannbenchOpcode;
++
++typedef struct FannbenchInstruction
++{
++	FannbenchOpcode opcode;
++	char		argument[FANNBENCH_ARGUMENT_MAX];
++	int64		intValue;
++	double		floatValue;
++	int32		target;
++} FannbenchInstruction;
++
++typedef enum FannbenchValueType
++{
++	FANNBENCH_UNAVAILABLE,
++	FANNBENCH_VALUE_INT,
++	FANNBENCH_VALUE_FLOAT,
++	FANNBENCH_VALUE_BOOL
++} FannbenchValueType;
++
++typedef struct FannbenchValue
++{
++	FannbenchValueType type;
++	int64		intValue;
++	double		floatValue;
++	bool		boolValue;
++} FannbenchValue;
++
++typedef struct FannbenchFeatures
++{
++	int64		k;
++	int64		predicateLeafCount;
++	int64		checkpointIndex;
++	int64		distanceEvaluations;
++	int64		distanceSinceCheckpoint;
++	int64		completedExpansions;
++} FannbenchFeatures;
++
++typedef struct FannbenchExecutionState
++{
++	bool		active;
++	char		mode[FANNBENCH_MODE_MAX];
++	char		nonce[FANNBENCH_NONCE_MAX];
++	char		policyHash[FANNBENCH_HASH_MAX];
++	bool		hasPolicyHash;
++	int64		fixedBudget;
++	int32		requestedK;
++	int32		predicateLeafCount;
++	int32		returnedCount;
++	bool		hnswReached;
++	int64		distanceEvaluations;
++	int64		distanceAtLastCheckpoint;
++	int64		checkpointCount;
++	int64		featureCollectionCount;
++	int64		featureCollectionNanos;
++	int64		policyEvaluationCount;
++	int64		policyEvaluationNanos;
++	int64		completedExpansions;
++	bool		fixedBudgetStopped;
++	bool		policyStopped;
++	bool		policyFallback;
++	char		policyRuntimeError[FANNBENCH_ERROR_MAX];
++} FannbenchExecutionState;
++
++static FannbenchExecutionState executionState;
++static FannbenchInstruction installedProgram[FANNBENCH_MAX_INSTRUCTIONS];
++static int32 installedInstructionCount;
++static char installedPolicyHash[FANNBENCH_HASH_MAX];
++static bool installedPolicy;
++
++PG_FUNCTION_INFO_V1(fannbench_install_policy);
++PG_FUNCTION_INFO_V1(fannbench_begin_execution);
++PG_FUNCTION_INFO_V1(fannbench_observe_result);
++PG_FUNCTION_INFO_V1(fannbench_last_execution);
++
++static void
++ResetExecutionState(void)
++{
++	MemSet(&executionState, 0, sizeof(executionState));
++}
++
++static void
++CopyTextArgument(text *value, char *destination, Size destinationSize, const char *name)
++{
++	char	   *source = text_to_cstring(value);
++
++	if (strlen(source) >= destinationSize)
++		ereport(ERROR,
++				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++				 errmsg("fannbench %s is too long", name)));
++	strlcpy(destination, source, destinationSize);
++	pfree(source);
++}
++
++static void
++ValidateToken(const char *value, const char *name)
++{
++	const char *cursor;
++
++	if (*value == '\0')
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("fannbench %s must not be empty", name)));
++	for (cursor = value; *cursor != '\0'; cursor++)
++		if (!(isalnum((unsigned char) *cursor) || *cursor == '_' || *cursor == '-'))
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("fannbench %s contains an invalid character", name)));
++}
++
++static bool
++KnownFeature(const char *name)
++{
++	static const char *features[] = {
++		"k", "predicate_leaf_count", "checkpoint_index",
++		"distance_evaluations", "distance_evaluations_since_checkpoint",
++		"unique_discoveries", "completed_expansions", "qualified_candidate_count",
++		"best_qualified_distance", "worst_qualified_top_k_distance",
++		"recent_distance_improvement", "recent_result_improvement",
++		"frontier_best_distance"
++	};
++	int			i;
++
++	for (i = 0; i < lengthof(features); i++)
++		if (strcmp(name, features[i]) == 0)
++			return true;
++	return false;
++}
++
++static bool
++KnownOperator(const char *name)
++{
++	static const char *operators[] = {
++		"not", "is_available", "and", "or", "add", "sub", "mul", "div",
++		"eq", "lt", "lte", "gt", "gte"
++	};
++	int			i;
++
++	for (i = 0; i < lengthof(operators); i++)
++		if (strcmp(name, operators[i]) == 0)
++			return true;
++	return false;
++}
++
++static void
++FannbenchXactCallback(XactEvent event, void *arg)
++{
++	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
++		event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT)
++		ResetExecutionState();
++}
++
++void
++FannbenchInit(void)
++{
++	ResetExecutionState();
++	installedPolicy = false;
++	installedInstructionCount = 0;
++	RegisterXactCallback(FannbenchXactCallback, NULL);
++}
++
++Datum
++fannbench_install_policy(PG_FUNCTION_ARGS)
++{
++	char	   *hash = text_to_cstring(PG_GETARG_TEXT_PP(0));
++	char	   *program = text_to_cstring(PG_GETARG_TEXT_PP(1));
++	char	   *lineSave = NULL;
++	char	   *line;
++	int32		count = 0;
++	int32		i;
++
++	if (strlen(hash) != 64)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("fannbench policy hash must contain 64 hexadecimal characters")));
++	ValidateToken(hash, "policy hash");
++	line = strtok_r(program, "\n", &lineSave);
++	if (line == NULL || strcmp(line, "FANNBENCH_POLICY_V1\t64") != 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("unsupported fannbench policy bytecode header")));
++
++	while ((line = strtok_r(NULL, "\n", &lineSave)) != NULL)
++	{
++		char	   *separator;
++		char	   *argument;
++		FannbenchInstruction *instruction;
++
++		if (count >= FANNBENCH_MAX_INSTRUCTIONS)
++			ereport(ERROR,
++					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++					 errmsg("fannbench policy exceeds %d instructions",
++							FANNBENCH_MAX_INSTRUCTIONS)));
++		separator = strchr(line, '\t');
++		if (separator == NULL || separator == line || separator[1] == '\0')
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("invalid fannbench policy instruction")));
++		*separator = '\0';
++		argument = separator + 1;
++		instruction = &installedProgram[count];
++		MemSet(instruction, 0, sizeof(*instruction));
++
++		if (strcmp(line, "FEATURE") == 0)
++		{
++			if (!KnownFeature(argument))
++				ereport(ERROR,
++						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						 errmsg("unknown fannbench feature: %s", argument)));
++			instruction->opcode = FANNBENCH_FEATURE;
++		}
++		else if (strcmp(line, "INT") == 0)
++		{
++			instruction->opcode = FANNBENCH_INT;
++			instruction->intValue = pg_strtoint64(argument);
++		}
++		else if (strcmp(line, "FLOAT") == 0)
++		{
++			char	   *end = NULL;
++
++			errno = 0;
++			instruction->opcode = FANNBENCH_FLOAT;
++			instruction->floatValue = strtod(argument, &end);
++			if (errno != 0 || end == argument || *end != '\0' ||
++				!isfinite(instruction->floatValue))
++				ereport(ERROR,
++						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						 errmsg("invalid fannbench float literal")));
++		}
++		else if (strcmp(line, "BOOL") == 0)
++		{
++			if (strcmp(argument, "0") != 0 && strcmp(argument, "1") != 0)
++				ereport(ERROR,
++						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						 errmsg("invalid fannbench Boolean literal")));
++			instruction->opcode = FANNBENCH_BOOL;
++			instruction->intValue = strcmp(argument, "1") == 0;
++		}
++		else if (strcmp(line, "OP") == 0)
++		{
++			if (!KnownOperator(argument))
++				ereport(ERROR,
++						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						 errmsg("unknown fannbench policy operator: %s", argument)));
++			instruction->opcode = FANNBENCH_OP;
++		}
++		else if (strcmp(line, "JIF") == 0)
++		{
++			instruction->opcode = FANNBENCH_JIF;
++			instruction->target = pg_strtoint32(argument);
++		}
++		else if (strcmp(line, "RETURN") == 0)
++		{
++			if (strcmp(argument, "stop") != 0 && strcmp(argument, "continue") != 0)
++				ereport(ERROR,
++						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						 errmsg("unknown fannbench policy decision: %s", argument)));
++			instruction->opcode = FANNBENCH_RETURN;
++		}
++		else
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("unknown fannbench policy instruction: %s", line)));
++
++		if (strlen(argument) >= sizeof(instruction->argument))
++			ereport(ERROR,
++					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++					 errmsg("fannbench policy instruction argument is too long")));
++		strlcpy(instruction->argument, argument, sizeof(instruction->argument));
++		count++;
++	}
++	if (count == 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("fannbench policy program must not be empty")));
++	for (i = 0; i < count; i++)
++		if (installedProgram[i].opcode == FANNBENCH_JIF &&
++			(installedProgram[i].target < 0 || installedProgram[i].target >= count))
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("fannbench policy jump target is outside the program")));
++
++	strlcpy(installedPolicyHash, hash, sizeof(installedPolicyHash));
++	installedInstructionCount = count;
++	installedPolicy = true;
++	pfree(hash);
++	pfree(program);
++	PG_RETURN_TEXT_P(cstring_to_text(installedPolicyHash));
++}
++
++Datum
++fannbench_begin_execution(PG_FUNCTION_ARGS)
++{
++	text	   *mode = PG_GETARG_TEXT_PP(0);
++	text	   *nonce = PG_GETARG_TEXT_PP(3);
++
++	ResetExecutionState();
++	CopyTextArgument(mode, executionState.mode, sizeof(executionState.mode), "mode");
++	CopyTextArgument(nonce, executionState.nonce, sizeof(executionState.nonce), "nonce");
++	ValidateToken(executionState.nonce, "nonce");
++
++	if (strcmp(executionState.mode, "native") != 0 &&
++		strcmp(executionState.mode, "policy_noop") != 0 &&
++		strcmp(executionState.mode, "fixed_budget") != 0 &&
++		strcmp(executionState.mode, "policy_agent") != 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("unsupported fannbench mode: %s", executionState.mode)));
++
++	if (!PG_ARGISNULL(1))
++	{
++		CopyTextArgument(PG_GETARG_TEXT_PP(1), executionState.policyHash,
++						 sizeof(executionState.policyHash), "policy hash");
++		ValidateToken(executionState.policyHash, "policy hash");
++		executionState.hasPolicyHash = true;
++	}
++	if (strcmp(executionState.mode, "policy_agent") == 0)
++	{
++		if (!executionState.hasPolicyHash)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("policy_agent mode requires a policy hash")));
++		if (!installedPolicy || strcmp(executionState.policyHash, installedPolicyHash) != 0)
++			ereport(ERROR,
++					(errcode(ERRCODE_UNDEFINED_OBJECT),
++					 errmsg("fannbench policy hash is not installed")));
++	}
++	else if (executionState.hasPolicyHash)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("policy hash is not valid for mode %s", executionState.mode)));
++
++	executionState.fixedBudget = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT64(2);
++	if (strcmp(executionState.mode, "fixed_budget") == 0)
++	{
++		if (executionState.fixedBudget <= 0)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("fixed_budget mode requires a positive budget")));
++	}
++	else if (executionState.fixedBudget != 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("fixed budget is only valid in fixed_budget mode")));
++
++	executionState.requestedK = PG_GETARG_INT32(4);
++	executionState.predicateLeafCount = PG_GETARG_INT32(5);
++	if (executionState.requestedK <= 0 || executionState.predicateLeafCount < 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("requested k must be positive and predicate count nonnegative")));
++	executionState.active = true;
++
++	PG_RETURN_TEXT_P(cstring_to_text(executionState.nonce));
++}
++
++Datum
++fannbench_observe_result(PG_FUNCTION_ARGS)
++{
++	if (!executionState.active)
++		ereport(ERROR,
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("no active fannbench execution")));
++	executionState.returnedCount++;
++	PG_RETURN_BOOL(true);
++}
++
++static FannbenchFeatures
++CollectPolicyFeatures(void)
++{
++	FannbenchFeatures features = {
++		executionState.requestedK,
++		executionState.predicateLeafCount,
++		executionState.checkpointCount,
++		executionState.distanceEvaluations,
++		executionState.distanceEvaluations - executionState.distanceAtLastCheckpoint,
++		executionState.completedExpansions
++	};
++
++	return features;
++}
++
++static FannbenchValue
++FeatureValue(const char *name, const FannbenchFeatures *features)
++{
++	FannbenchValue value = {0};
++
++	if (strcmp(name, "k") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = features->k;
++	}
++	else if (strcmp(name, "predicate_leaf_count") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = features->predicateLeafCount;
++	}
++	else if (strcmp(name, "checkpoint_index") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = features->checkpointIndex;
++	}
++	else if (strcmp(name, "distance_evaluations") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = features->distanceEvaluations;
++	}
++	else if (strcmp(name, "distance_evaluations_since_checkpoint") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = features->distanceSinceCheckpoint;
++	}
++	else if (strcmp(name, "completed_expansions") == 0)
++	{
++		value.type = FANNBENCH_VALUE_INT;
++		value.intValue = features->completedExpansions;
++	}
++	else
++		value.type = FANNBENCH_UNAVAILABLE;
++	return value;
++}
++
++static void
++SetPolicyError(const char *message)
++{
++	executionState.policyFallback = true;
++	if (executionState.policyRuntimeError[0] == '\0')
++		strlcpy(executionState.policyRuntimeError, message,
++				sizeof(executionState.policyRuntimeError));
++}
++
++static bool
++EvaluatePolicy(const FannbenchFeatures *features, bool *stop)
++{
++	FannbenchValue stack[FANNBENCH_MAX_STACK];
++	int32		stackSize = 0;
++	int32		pc = 0;
++
++	while (pc < installedInstructionCount)
++	{
++		FannbenchInstruction *instruction = &installedProgram[pc];
++
++		if (instruction->opcode == FANNBENCH_FEATURE)
++		{
++			if (stackSize >= FANNBENCH_MAX_STACK)
++				goto stack_error;
++			stack[stackSize++] = FeatureValue(instruction->argument, features);
++			pc++;
++		}
++		else if (instruction->opcode == FANNBENCH_INT ||
++				 instruction->opcode == FANNBENCH_FLOAT ||
++				 instruction->opcode == FANNBENCH_BOOL)
++		{
++			FannbenchValue value = {0};
++
++			if (stackSize >= FANNBENCH_MAX_STACK)
++				goto stack_error;
++			if (instruction->opcode == FANNBENCH_INT)
++			{
++				value.type = FANNBENCH_VALUE_INT;
++				value.intValue = instruction->intValue;
++			}
++			else if (instruction->opcode == FANNBENCH_FLOAT)
++			{
++				value.type = FANNBENCH_VALUE_FLOAT;
++				value.floatValue = instruction->floatValue;
++			}
++			else
++			{
++				value.type = FANNBENCH_VALUE_BOOL;
++				value.boolValue = instruction->intValue != 0;
++			}
++			stack[stackSize++] = value;
++			pc++;
++		}
++		else if (instruction->opcode == FANNBENCH_OP)
++		{
++			FannbenchValue left = {0};
++			FannbenchValue right = {0};
++			FannbenchValue result = {0};
++			bool		unary = strcmp(instruction->argument, "not") == 0 ||
++				strcmp(instruction->argument, "is_available") == 0;
++
++			if (stackSize < (unary ? 1 : 2))
++				goto stack_error;
++			right = stack[--stackSize];
++			if (!unary)
++				left = stack[--stackSize];
++
++			if (strcmp(instruction->argument, "is_available") == 0)
++			{
++				result.type = FANNBENCH_VALUE_BOOL;
++				result.boolValue = right.type != FANNBENCH_UNAVAILABLE;
++			}
++			else if (right.type == FANNBENCH_UNAVAILABLE ||
++					 (!unary && left.type == FANNBENCH_UNAVAILABLE))
++				result.type = FANNBENCH_UNAVAILABLE;
++			else if (strcmp(instruction->argument, "not") == 0)
++			{
++				if (right.type != FANNBENCH_VALUE_BOOL)
++					goto type_error;
++				result.type = FANNBENCH_VALUE_BOOL;
++				result.boolValue = !right.boolValue;
++			}
++			else if (strcmp(instruction->argument, "and") == 0 ||
++					 strcmp(instruction->argument, "or") == 0)
++			{
++				if (left.type != FANNBENCH_VALUE_BOOL || right.type != FANNBENCH_VALUE_BOOL)
++					goto type_error;
++				result.type = FANNBENCH_VALUE_BOOL;
++				result.boolValue = strcmp(instruction->argument, "and") == 0 ?
++					(left.boolValue && right.boolValue) : (left.boolValue || right.boolValue);
++			}
++			else if (strcmp(instruction->argument, "add") == 0 ||
++					 strcmp(instruction->argument, "sub") == 0 ||
++					 strcmp(instruction->argument, "mul") == 0)
++			{
++				if (left.type != right.type ||
++					(left.type != FANNBENCH_VALUE_INT && left.type != FANNBENCH_VALUE_FLOAT))
++					goto type_error;
++				result.type = left.type;
++				if (left.type == FANNBENCH_VALUE_INT)
++				{
++					bool overflow;
++
++					if (strcmp(instruction->argument, "add") == 0)
++						overflow = pg_add_s64_overflow(left.intValue, right.intValue,
++												  &result.intValue);
++					else if (strcmp(instruction->argument, "sub") == 0)
++						overflow = pg_sub_s64_overflow(left.intValue, right.intValue,
++												  &result.intValue);
++					else
++						overflow = pg_mul_s64_overflow(left.intValue, right.intValue,
++												  &result.intValue);
++					if (overflow)
++					{
++						SetPolicyError("policy int64 arithmetic overflow");
++						return false;
++					}
++				}
++				else
++				{
++					if (strcmp(instruction->argument, "add") == 0)
++						result.floatValue = left.floatValue + right.floatValue;
++					else if (strcmp(instruction->argument, "sub") == 0)
++						result.floatValue = left.floatValue - right.floatValue;
++					else
++						result.floatValue = left.floatValue * right.floatValue;
++					if (!isfinite(result.floatValue))
++					{
++						SetPolicyError("policy float operation produced a non-finite value");
++						return false;
++					}
++				}
++			}
++			else if (strcmp(instruction->argument, "div") == 0)
++			{
++				double leftValue;
++				double rightValue;
++
++				if (left.type != right.type ||
++					(left.type != FANNBENCH_VALUE_INT && left.type != FANNBENCH_VALUE_FLOAT))
++					goto type_error;
++				leftValue = left.type == FANNBENCH_VALUE_INT ?
++					(double) left.intValue : left.floatValue;
++				rightValue = right.type == FANNBENCH_VALUE_INT ?
++					(double) right.intValue : right.floatValue;
++				if (rightValue == 0 ||
++					(left.type == FANNBENCH_VALUE_INT &&
++					 (left.intValue > 9007199254740992LL ||
++					  left.intValue < -9007199254740992LL ||
++					  right.intValue > 9007199254740992LL ||
++					  right.intValue < -9007199254740992LL)))
++				{
++					SetPolicyError(rightValue == 0 ? "policy division by zero" :
++								   "policy integer division would lose float64 precision");
++					return false;
++				}
++				result.type = FANNBENCH_VALUE_FLOAT;
++				result.floatValue = leftValue / rightValue;
++				if (!isfinite(result.floatValue))
++				{
++					SetPolicyError("policy float operation produced a non-finite value");
++					return false;
++				}
++			}
++			else
++			{
++				bool comparison;
++
++				if (left.type != right.type)
++					goto type_error;
++				if (strcmp(instruction->argument, "eq") == 0)
++				{
++					if (left.type == FANNBENCH_VALUE_INT)
++						comparison = left.intValue == right.intValue;
++					else if (left.type == FANNBENCH_VALUE_FLOAT)
++						comparison = left.floatValue == right.floatValue;
++					else if (left.type == FANNBENCH_VALUE_BOOL)
++						comparison = left.boolValue == right.boolValue;
++					else
++						goto type_error;
++				}
++				else
++				{
++					if (left.type == FANNBENCH_VALUE_INT)
++					{
++						if (strcmp(instruction->argument, "lt") == 0)
++							comparison = left.intValue < right.intValue;
++						else if (strcmp(instruction->argument, "lte") == 0)
++							comparison = left.intValue <= right.intValue;
++						else if (strcmp(instruction->argument, "gt") == 0)
++							comparison = left.intValue > right.intValue;
++						else
++							comparison = left.intValue >= right.intValue;
++					}
++					else if (left.type == FANNBENCH_VALUE_FLOAT)
++					{
++						if (strcmp(instruction->argument, "lt") == 0)
++							comparison = left.floatValue < right.floatValue;
++						else if (strcmp(instruction->argument, "lte") == 0)
++							comparison = left.floatValue <= right.floatValue;
++						else if (strcmp(instruction->argument, "gt") == 0)
++							comparison = left.floatValue > right.floatValue;
++						else
++							comparison = left.floatValue >= right.floatValue;
++					}
++					else
++						goto type_error;
++				}
++				result.type = FANNBENCH_VALUE_BOOL;
++				result.boolValue = comparison;
++			}
++			stack[stackSize++] = result;
++			pc++;
++		}
++		else if (instruction->opcode == FANNBENCH_JIF)
++		{
++			FannbenchValue condition;
++
++			if (stackSize < 1)
++				goto stack_error;
++			condition = stack[--stackSize];
++			if (condition.type == FANNBENCH_UNAVAILABLE)
++			{
++				SetPolicyError("policy condition depends on an unavailable feature");
++				return false;
++			}
++			if (condition.type != FANNBENCH_VALUE_BOOL)
++				goto type_error;
++			pc = condition.boolValue ? pc + 1 : instruction->target;
++		}
++		else if (instruction->opcode == FANNBENCH_RETURN)
++		{
++			*stop = strcmp(instruction->argument, "stop") == 0;
++			return true;
++		}
++	}
++	SetPolicyError("policy program ended without a decision");
++	return false;
++
++stack_error:
++	SetPolicyError("policy stack contract was violated");
++	return false;
++type_error:
++	SetPolicyError("policy value type contract was violated");
++	return false;
++}
++
++void
++FannbenchHnswRouteReached(void)
++{
++	if (executionState.active)
++		executionState.hnswReached = true;
++}
++
++bool
++FannbenchHnswObserveDistances(int64 count)
++{
++	if (!executionState.active || count <= 0)
++		return false;
++	executionState.hnswReached = true;
++	if (strcmp(executionState.mode, "native") == 0)
++		return false;
++	executionState.completedExpansions++;
++	executionState.distanceEvaluations += count;
++	if (executionState.distanceEvaluations >=
++		(executionState.checkpointCount + 1) * FANNBENCH_CHECKPOINT_INTERVAL)
++	{
++		bool		stop = false;
++		FannbenchFeatures features;
++		instr_time	started;
++		instr_time	elapsed;
++
++		executionState.checkpointCount++;
++		if (strcmp(executionState.mode, "policy_noop") == 0 ||
++			strcmp(executionState.mode, "policy_agent") == 0)
++		{
++			INSTR_TIME_SET_CURRENT(started);
++			features = CollectPolicyFeatures();
++			INSTR_TIME_SET_CURRENT(elapsed);
++			INSTR_TIME_SUBTRACT(elapsed, started);
++			executionState.featureCollectionCount++;
++			executionState.featureCollectionNanos += INSTR_TIME_GET_NANOSEC(elapsed);
++			if (strcmp(executionState.mode, "policy_agent") == 0 &&
++				!executionState.policyFallback)
++			{
++				INSTR_TIME_SET_CURRENT(started);
++				executionState.policyEvaluationCount++;
++				if (EvaluatePolicy(&features, &stop) && stop)
++					executionState.policyStopped = true;
++				INSTR_TIME_SET_CURRENT(elapsed);
++				INSTR_TIME_SUBTRACT(elapsed, started);
++				executionState.policyEvaluationNanos += INSTR_TIME_GET_NANOSEC(elapsed);
++			}
++		}
++		if (strcmp(executionState.mode, "fixed_budget") == 0 &&
++			executionState.distanceEvaluations >= executionState.fixedBudget)
++			executionState.fixedBudgetStopped = true;
++		executionState.distanceAtLastCheckpoint = executionState.distanceEvaluations;
++	}
++	return executionState.fixedBudgetStopped || executionState.policyStopped;
++}
++
++Datum
++fannbench_last_execution(PG_FUNCTION_ARGS)
++{
++	char	   *nonce;
++	StringInfoData result;
++	const char *path;
++	const char *stopReason;
++	bool		opportunity;
++	bool		observationApplied;
++	bool		policyApplied;
++	bool		nativeMode;
++
++	if (!executionState.active)
++		ereport(ERROR,
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("no active fannbench execution")));
++	nonce = text_to_cstring(PG_GETARG_TEXT_PP(0));
++	if (strcmp(nonce, executionState.nonce) != 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("fannbench execution nonce does not match")));
++
++	path = executionState.hnswReached ?
++		"postgresql_pgvector_hnsw" : "postgresql_non_hnsw";
++	if (executionState.policyStopped)
++		stopReason = "policy_stop";
++	else if (executionState.fixedBudgetStopped)
++		stopReason = "fixed_budget_stop";
++	else if (executionState.returnedCount >= executionState.requestedK)
++		stopReason = "native_limit";
++	else
++		stopReason = "exhausted";
++	opportunity = executionState.checkpointCount > 0;
++	observationApplied = executionState.featureCollectionCount > 0;
++	policyApplied = executionState.policyEvaluationCount > 0 &&
++		strcmp(executionState.mode, "policy_agent") == 0;
++	nativeMode = strcmp(executionState.mode, "native") == 0;
++
++	initStringInfo(&result);
++	appendStringInfo(&result,
++					 "{\"protocol\":\"same_execution_v2\","
++					 "\"request_nonce\":\"%s\",\"effective_mode\":\"%s\","
++					 "\"policy_hash\":",
++					 executionState.nonce, executionState.mode);
++	if (executionState.hasPolicyHash)
++		appendStringInfo(&result, "\"%s\"", executionState.policyHash);
++	else
++		appendStringInfoString(&result, "null");
++	appendStringInfo(&result,
++					 ",\"observation_applied\":%s,\"policy_applied\":%s,"
++					 "\"policy_opportunity\":",
++					 observationApplied ? "true" : "false",
++					 policyApplied ? "true" : "false");
++	if (nativeMode)
++		appendStringInfoString(&result, "null");
++	else
++		appendStringInfoString(&result, opportunity ? "true" : "false");
++	appendStringInfo(&result,
++					 ",\"executed_path\":\"%s\",\"stop_reason\":\"%s\","
++					 "\"checkpoint_count\":",
++					 path, stopReason);
++	if (nativeMode)
++		appendStringInfoString(&result, "null,\"work_counters\":{}");
++	else
++		appendStringInfo(&result,
++						 INT64_FORMAT ",\"work_counters\":{"
++						 "\"distance_evaluations\":" INT64_FORMAT ","
++						 "\"completed_expansions\":" INT64_FORMAT ","
++						 "\"feature_collection_count\":" INT64_FORMAT ","
++						 "\"feature_collection_ns\":" INT64_FORMAT ","
++						 "\"policy_evaluation_count\":" INT64_FORMAT ","
++						 "\"policy_evaluation_ns\":" INT64_FORMAT "}",
++						 executionState.checkpointCount,
++						 executionState.distanceEvaluations,
++						 executionState.completedExpansions,
++						 executionState.featureCollectionCount,
++						 executionState.featureCollectionNanos,
++						 executionState.policyEvaluationCount,
++						 executionState.policyEvaluationNanos);
++	appendStringInfo(&result,
++					 ",\"policy_fallback\":%s,\"policy_runtime_error\":",
++					 executionState.policyFallback ? "true" : "false");
++	if (executionState.policyRuntimeError[0] != '\0')
++		appendStringInfo(&result, "\"%s\"", executionState.policyRuntimeError);
++	else
++		appendStringInfoString(&result, "null");
++	appendStringInfoChar(&result, '}');
++	ResetExecutionState();
++	pfree(nonce);
++	PG_RETURN_TEXT_P(cstring_to_text(result.data));
++}
+diff --git a/src/fannbench.h b/src/fannbench.h
+new file mode 100644
+index 0000000..0d3c445
+--- /dev/null
++++ b/src/fannbench.h
+@@ -0,0 +1,10 @@
++#ifndef FANNBENCH_H
++#define FANNBENCH_H
++
++#include "postgres.h"
++
++void		FannbenchInit(void);
++void		FannbenchHnswRouteReached(void);
++bool		FannbenchHnswObserveDistances(int64 count);
++
++#endif
+diff --git a/src/hnswscan.c b/src/hnswscan.c
+index 1c50efb..ba7df6c 100644
+--- a/src/hnswscan.c
++++ b/src/hnswscan.c
+@@ -4,6 +4,7 @@
+ 
+ #include "access/genam.h"
+ #include "access/relscan.h"
++#include "fannbench.h"
+ #include "hnsw.h"
+ #include "lib/pairingheap.h"
+ #include "miscadmin.h"
+@@ -52,6 +53,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
+ 		ep = w;
+ 	}
+ 
++	FannbenchHnswRouteReached();
+ 	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
+ }
+ 
+diff --git a/src/hnswutils.c b/src/hnswutils.c
+index 26331fc..e3089da 100644
+--- a/src/hnswutils.c
++++ b/src/hnswutils.c
+@@ -5,6 +5,7 @@
+ #include "access/genam.h"
+ #include "access/generic_xlog.h"
+ #include "common/hashfn.h"
++#include "fannbench.h"
+ #include "fmgr.h"
+ #include "hnsw.h"
+ #include "lib/pairingheap.h"
+@@ -971,6 +972,9 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 				}
+ 			}
+ 		}
++
++		if (lc == 0 && !inserting && FannbenchHnswObserveDistances(unvisitedLength))
++			break;
+ 	}
+ 
+ 	/* Add each element of W to w */
+diff --git a/src/vector.c b/src/vector.c
+index b75cfc4..9177816 100644
+--- a/src/vector.c
++++ b/src/vector.c
+@@ -6,6 +6,7 @@
+ #include "bitvec.h"
+ #include "catalog/pg_type.h"
+ #include "common/shortest_dec.h"
++#include "fannbench.h"
+ #include "fmgr.h"
+ #include "halfutils.h"
+ #include "halfvec.h"
+@@ -62,6 +63,7 @@ _PG_init(void)
+ 	HalfvecInit();
+ 	HnswInit();
+ 	IvfflatInit();
++	FannbenchInit();
+ }
+ 
+ /*

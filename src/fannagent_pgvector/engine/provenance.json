@@ -1,0 +1,86 @@
+{
+  "profile": "fannagent_pgvector_v1",
+  "pgvector": {
+    "version": "0.8.6",
+    "repository": "https://github.com/pgvector/pgvector",
+    "commit": "8ee86c96f0fd72390f890aa8a336fda6d3ab4c6c"
+  },
+  "postgresql": {
+    "version": "17.11",
+    "repository": "https://git.postgresql.org/git/postgresql.git",
+    "commit": "083ac033419f690758508e08c1736089384bbee8",
+    "executor_patch": "postgresql-17.11-executor.patch",
+    "executor_patch_sha256": "49b5298c863a3e8007fbaa8d5f8ffab7e68fc4a8d14a9709b0b0bdc57947e09d"
+  },
+  "base_image": {
+    "reference": "postgres:17-trixie@sha256:f4c66b820c6f974249089d3d16d86a3698eae11e8746eb6644b2271031e91232"
+  },
+  "patches": [
+    {
+      "path": "patches/0001-same-execution-observability.patch",
+      "sha256": "eaa8d3294629bb81629e9f2fbcd81679519eaf9d7486dc51cdbcf3a16fcf7ba8"
+    },
+    {
+      "path": "patches/0002-paper-informed-evidence.patch",
+      "sha256": "800501dccb0ed50226bf73af0d48f8d981f6f7202507e9be279bf6f2d3882149"
+    },
+    {
+      "path": "patches/0003-close-remaining-gaps.patch",
+      "sha256": "0c06c627c3bc65605bc3b349bad1aac5f7cf343ef32158f0899f049fe52babad"
+    },
+    {
+      "path": "patches/0004-existing-target-binding.patch",
+      "sha256": "0223e01eaff379a0785d67000a40ab57e8033cdef3eff3da1b7d19b2021d0ec3"
+    }
+  ],
+  "unverified": [
+    "native amd64 qualification",
+    "public registry publication",
+    "general deployment qualification beyond tested fixture"
+  ],
+  "distribution": "source recipe and local image; image_id is not a published registry manifest digest",
+  "historical_verified_build": {
+    "architecture": "arm64",
+    "tag": "fannagent/pgvector:0.8.6-v1",
+    "image_id": "sha256:74da5876df8195bb1bc91b36b62916ffed3c509f7a03198d8fb3a745c8de9d39",
+    "qualification": "Supplied and agent-managed streamed-WAL stock physical backup fixtures; native/no-op/continue, real filtered stop, HOT/duplicate/timeout/abort boundaries, final image and float32 sidecar verified locally.",
+    "binary_qualification_image_id": "sha256:6bd0e81404c93c6b79cc16db096619fa22361ec8604e19bf2e43c1d425b8e4ff"
+  },
+  "qualification_status": "fresh disposable ARM64 qualification passed for both backup methods",
+  "verified_local_build": {
+    "architecture": "arm64",
+    "tag": "fannagent/pgvector:0.8.6-secure-v1",
+    "image_id": "sha256:7aceb4c82fc429df17b7eda410d3d7c5cd0aeb2f66d002a54898fe823641e82f",
+    "qualification": "2026-10-06: supplied and streamed-WAL physical restores; native/no-op/continue, stopping, exact SQL, source query-role permissions/defaults, unchanged HNSW hashes, public SDK labels, policy sessions/fallback, SCRAM authentication, private networking, denied outbound connections, runtime tamper refusal and repeated cleanup. Physical and logical replication, UDP/DNS/host egress and actual bootstrap/firewall/startup failure injections also passed.",
+    "results_reference": "QUALIFICATION.md",
+    "qualification_results": ".qualification/c491d4562b/results.json"
+  },
+  "historical_core_build": {
+    "architecture": "arm64",
+    "tag": "fannagent/pgvector:0.8.6-core-v2",
+    "image_id": "sha256:ea0c2c72530f269b2063661d544417100714beead9e224eb9f5d3fd02b010f89",
+    "qualification": "2026-10-06: supplied and streamed-WAL physical restores; native/no-op/continue, actual stops, exact SQL, bigint extrema, nulls, quoted fields, truncation, abort/timeout/reuse, HOT/duplicate identities, snapshot invalidation, public checkpoint labeling, serving/fallback and repeated cleanup; mutating cases use fresh restores.",
+    "results_reference": "QUALIFICATION.md"
+  },
+  "copy_security": {
+    "version": 1,
+    "required_image_labels": {
+      "io.fannagent.copy_security": "1",
+      "io.fannagent.copy_proxy": "1"
+    },
+    "minimum_docker_engine_major": 28,
+    "minimum_libpq_major": 16,
+    "semantic_profile_fingerprint": "3d869e5b919b231f913209fe33ec6b829e7b990cf4666a632d092556ff51958d",
+    "files": {
+      "Dockerfile": "ed1cad381292ff29d2a19e3aebb5e81519f1d682e426ba27eb7c70f76683f436",
+      "copy-entrypoint.sh": "0dd527b3474b5baab3ad947e534bfc8f23fde9d9edc957fc41723ad87d315f58",
+      "copy.nft": "8fcaef417108858ba303240a956eb94c9c829edb87ff374c39c6aa594f222a54",
+      "proxy.nft": "07e7a22d52399b023f1c2f2838eca088bcf61142361d4ad233cdfc82477b5dc0"
+    },
+    "qualified_host": {
+      "docker_engine": "29.6.1",
+      "psycopg": "3.3.6",
+      "libpq": "18.6"
+    }
+  }
+}
