@@ -95,7 +95,12 @@ def test_pgvector_startup_summary_from_saved_manifest(tmp_path, monkeypatch, mod
         backend.data_profile,
     )
     study = SimpleNamespace(
-        backend=backend, store=store, snapshot=snapshot, checkpoint_policy_hash=lambda: None
+        backend=backend,
+        store=store,
+        snapshot=snapshot,
+        checkpoint_policy_hash=lambda: None,
+        development=[],
+        config=config,
     )
     tools = Tools(study, Budget(store, config.model))
     context = tools.startup_context()

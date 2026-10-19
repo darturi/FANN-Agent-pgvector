@@ -1,0 +1,127 @@
+diff --git a/src/fannbench.c b/src/fannbench.c
+index dde14e0..9a9eac9 100644
+--- a/src/fannbench.c
++++ b/src/fannbench.c
+@@ -117,6 +117,14 @@ typedef struct FannbenchExecutionState
+ 	int64		checkpointCount;
+ 	int64		featureCollectionCount;
+ 	int64		featureCollectionNanos;
++	int64		frontierSnapshotCount;
++	int64		frontierValuesCopied;
++	int64		frontierMaximumCount;
++	int64		frontierTraversalNanos;
++	int64		frontierStatisticsNanos;
++	int64		frontierSortCount;
++	int64		frontierSortNanos;
++	int64		frontierQuantileNanos;
+ 	int64		policyEvaluationCount;
+ 	int64		policyEvaluationNanos;
+ 	int64		completedExpansions;
+@@ -1742,19 +1750,36 @@ FannbenchHnswSetFrontierDistances(double *distances, int count,
+ {
+ 	double		mean = 0;
+ 	double		variance = 0;
++	double		minimum;
++	double		maximum;
++	bool		needQuantiles;
+ 	instr_time	started;
++	instr_time	phaseStarted;
++	instr_time	phaseElapsed;
+ 	instr_time	elapsed;
+ 
+ 	executionState.hasFrontierStats = false;
+ 	executionState.featureCollectionNanos += traversalNanos;
+-	if (!executionState.active || count <= 0)
++	if (!executionState.active)
++		return;
++	executionState.frontierSnapshotCount++;
++	executionState.frontierTraversalNanos += traversalNanos;
++	if (count <= 0)
+ 		return;
++	executionState.frontierValuesCopied += count;
++	if (count > executionState.frontierMaximumCount)
++		executionState.frontierMaximumCount = count;
+ 	INSTR_TIME_SET_CURRENT(started);
++	minimum = maximum = distances[0];
+ 	for (int i = 0; i < count; i++)
+ 	{
+ 		if (!isfinite(distances[i]))
+ 			return;
+ 		mean += distances[i];
++		if (distances[i] < minimum)
++			minimum = distances[i];
++		if (distances[i] > maximum)
++			maximum = distances[i];
+ 	}
+ 	mean /= count;
+ 	for (int i = 0; i < count; i++)
+@@ -1764,17 +1789,34 @@ FannbenchHnswSetFrontierDistances(double *distances, int count,
+ 		variance += delta * delta;
+ 	}
+ 	variance /= count;
+-	qsort(distances, count, sizeof(double), CompareQueueDistance);
+-	executionState.frontierStats[0] = distances[0];
+-	executionState.frontierStats[1] = distances[count - 1];
++	/* Keep the original two-pass reduction order for mean and variance. */
++	executionState.frontierStats[0] = minimum;
++	executionState.frontierStats[1] = maximum;
+ 	executionState.frontierStats[2] = mean;
+ 	executionState.frontierStats[3] = variance;
+-	if (executionState.queueQuantilesEnabled ||
+-		strcmp(executionState.traceLevel, "checkpoints") == 0)
++	INSTR_TIME_SET_CURRENT(phaseElapsed);
++	INSTR_TIME_SUBTRACT(phaseElapsed, started);
++	executionState.frontierStatisticsNanos += INSTR_TIME_GET_NANOSEC(phaseElapsed);
++	needQuantiles = executionState.queueQuantilesEnabled ||
++		strcmp(executionState.traceLevel, "checkpoints") == 0;
++	if (needQuantiles)
+ 	{
++		INSTR_TIME_SET_CURRENT(phaseStarted);
++		qsort(distances, count, sizeof(double), CompareQueueDistance);
++		INSTR_TIME_SET_CURRENT(phaseElapsed);
++		INSTR_TIME_SUBTRACT(phaseElapsed, phaseStarted);
++		executionState.frontierSortCount++;
++		executionState.frontierSortNanos += INSTR_TIME_GET_NANOSEC(phaseElapsed);
++		INSTR_TIME_SET_CURRENT(phaseStarted);
++		/* Preserve sorted boundary values, including equal-valued trace ties. */
++		executionState.frontierStats[0] = distances[0];
++		executionState.frontierStats[1] = distances[count - 1];
+ 		executionState.frontierStats[4] = QueuePercentile(distances, count, 0.25);
+ 		executionState.frontierStats[5] = QueuePercentile(distances, count, 0.5);
+ 		executionState.frontierStats[6] = QueuePercentile(distances, count, 0.75);
++		INSTR_TIME_SET_CURRENT(phaseElapsed);
++		INSTR_TIME_SUBTRACT(phaseElapsed, phaseStarted);
++		executionState.frontierQuantileNanos += INSTR_TIME_GET_NANOSEC(phaseElapsed);
+ 	}
+ 	executionState.hasFrontierStats = true;
+ 	INSTR_TIME_SET_CURRENT(elapsed);
+@@ -1978,6 +2020,14 @@ fannbench_last_execution(PG_FUNCTION_ARGS)
+ 						 "\"executor_tuple_fail_count\":" INT64_FORMAT ","
+ 						 "\"feature_collection_count\":" INT64_FORMAT ","
+ 						 "\"feature_collection_ns\":" INT64_FORMAT ","
++						 "\"frontier_snapshot_count\":" INT64_FORMAT ","
++						 "\"frontier_values_copied\":" INT64_FORMAT ","
++						 "\"frontier_maximum_count\":" INT64_FORMAT ","
++						 "\"frontier_traversal_ns\":" INT64_FORMAT ","
++						 "\"frontier_statistics_ns\":" INT64_FORMAT ","
++						 "\"frontier_sort_count\":" INT64_FORMAT ","
++						 "\"frontier_sort_ns\":" INT64_FORMAT ","
++						 "\"frontier_quantile_ns\":" INT64_FORMAT ","
+ 						 "\"policy_evaluation_count\":" INT64_FORMAT ","
+ 						 "\"policy_evaluation_ns\":" INT64_FORMAT "}",
+ 						 executionState.checkpointCount,
+@@ -1992,6 +2042,14 @@ fannbench_last_execution(PG_FUNCTION_ARGS)
+ 						 executionState.executorTupleFailCount,
+ 						 executionState.featureCollectionCount,
+ 						 executionState.featureCollectionNanos,
++						 executionState.frontierSnapshotCount,
++						 executionState.frontierValuesCopied,
++						 executionState.frontierMaximumCount,
++						 executionState.frontierTraversalNanos,
++						 executionState.frontierStatisticsNanos,
++						 executionState.frontierSortCount,
++						 executionState.frontierSortNanos,
++						 executionState.frontierQuantileNanos,
+ 						 executionState.policyEvaluationCount,
+ 						 executionState.policyEvaluationNanos);
+ 	appendStringInfo(&result,

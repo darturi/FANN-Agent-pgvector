@@ -31,6 +31,14 @@
     {
       "path": "patches/0004-existing-target-binding.patch",
       "sha256": "0223e01eaff379a0785d67000a40ab57e8033cdef3eff3da1b7d19b2021d0ec3"
+    },
+    {
+      "path": "patches/0005-reviews-runtime-fixes.patch",
+      "sha256": "097425638420914d7409d28ed38fe5ea2fbbd67a31038c288d086170f0fd6f1c"
+    },
+    {
+      "path": "patches/0006-demand-frontier-statistics.patch",
+      "sha256": "d40a2db61888b1447f0f4a515e6eb598d5b0777a0794bea926c8606660694710"
     }
   ],
   "unverified": [
@@ -46,7 +54,7 @@
     "qualification": "Supplied and agent-managed streamed-WAL stock physical backup fixtures; native/no-op/continue, real filtered stop, HOT/duplicate/timeout/abort boundaries, final image and float32 sidecar verified locally.",
     "binary_qualification_image_id": "sha256:6bd0e81404c93c6b79cc16db096619fa22361ec8604e19bf2e43c1d425b8e4ff"
   },
-  "qualification_status": "fresh disposable ARM64 qualification passed for both backup methods",
+  "qualification_status": "Historical qualification below remains baseline-only; collector patch passed local ARM tests, with full copy/deployment and x86 Torch qualification pending",
   "verified_local_build": {
     "architecture": "arm64",
     "tag": "fannagent/pgvector:0.8.6-secure-v1",
@@ -81,6 +89,38 @@
       "docker_engine": "29.6.1",
       "psycopg": "3.3.6",
       "libpq": "18.6"
+    }
+  },
+  "queue_statistics_optimization": {
+    "extension_baseline_commit": "a32a98f",
+    "Reviews_engine_baseline_commit": "90bce22",
+    "scope": "Skip frontier sorting unless percentiles or checkpoint traces are enabled; retain two-pass mean/variance reduction order; add diagnostic work counters",
+    "semantic_profile_changed": false,
+    "checkpoint_schedule_changed": false,
+    "feature_registry_changed": false,
+    "qualification": "107 non-integration extension tests passed; compiled-C baseline equivalence and native ARM synthetic A/B passed. Full copy/deployment qualification and x86 Torch performance remain unverified.",
+    "telemetry_version": 1,
+    "work_counter_fields": [
+      "frontier_snapshot_count",
+      "frontier_values_copied",
+      "frontier_maximum_count",
+      "frontier_traversal_ns",
+      "frontier_statistics_ns",
+      "frontier_sort_count",
+      "frontier_sort_ns",
+      "frontier_quantile_ns"
+    ],
+    "verified_native_fixture": {
+      "architecture": "arm64",
+      "rows": 4000,
+      "dimensions": 16,
+      "backend_queries": 960,
+      "matched_cases": 180,
+      "baseline_library_sha256": "669da7c8a59f26e93ba76958144b2ed2358e61e9931abf34f826f9f55a0ad27b",
+      "optimized_library_sha256": "c058c641c1698746984eaf21f35850ec4a72d31684b5dd3863a5bd020619397a",
+      "results_reference": ".qualification/queue-statistics-20261019/results.json",
+      "runtime_image": "sha256:2f5c021637bf2579233d85e4a9074e6c5007c14202f113ff67a064c308e87078",
+      "performance_scope": "Synthetic fixture, fixed baseline-then-optimized order; no Reviews/Torch performance claim"
     }
   }
 }

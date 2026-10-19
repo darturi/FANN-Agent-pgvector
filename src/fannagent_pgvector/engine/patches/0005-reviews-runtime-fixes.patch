@@ -1,0 +1,55 @@
+--- a/src/fannbench.c
++++ b/src/fannbench.c
+@@ -183,6 +183,7 @@
+ static char installedPolicyHash[FANNBENCH_HASH_MAX];
+ static bool installedPolicy;
+ static bool installedPolicyV2;
++static bool installedQueueStatsRequired;
+ 
+ /* The pinned PostgreSQL 17.11 executor patch exports this optional hook. */
+ typedef void (*FannbenchScanQualHook) (ScanState *node, TupleTableSlot *slot,
+@@ -765,6 +766,7 @@
+ 	ResetExecutionState();
+ 	installedPolicy = false;
+ 	installedInstructionCount = 0;
++	installedQueueStatsRequired = false;
+ 	RegisterXactCallback(FannbenchXactCallback, NULL);
+ 	fannbench_scan_qual_hook = FannbenchScanQual;
+ }
+@@ -894,6 +896,12 @@
+ 
+ 	strlcpy(installedPolicyHash, hash, sizeof(installedPolicyHash));
+ 	installedInstructionCount = count;
++	installedQueueStatsRequired = false;
++	for (i = 0; i < count; i++)
++		if (installedProgram[i].opcode == FANNBENCH_FEATURE &&
++			strncmp(installedProgram[i].argument, "frontier_distance_", 18) == 0 &&
++			strcmp(installedProgram[i].argument, "frontier_distance_min") != 0)
++			installedQueueStatsRequired = true;
+ 	installedPolicy = true;
+ 	pfree(hash);
+ 	pfree(program);
+@@ -1177,6 +1185,12 @@
+ 	{
+ 		value.type = FANNBENCH_VALUE_INT;
+ 		value.intValue = executionState.frontierCount;
++	}
++	else if (installedPolicyV2 && strcmp(name, "entry_distance") == 0 &&
++		 executionState.hasEntryDistance)
++	{
++		value.type = FANNBENCH_VALUE_FLOAT;
++		value.floatValue = executionState.entryDistance;
+ 	}
+ 	else if (installedPolicyV2 && strcmp(name, "frontier_distance_min") == 0 &&
+ 		 executionState.hasFrontier)
+@@ -1647,7 +1661,9 @@
+ FannbenchHnswQueueSnapshotNeeded(int64 upcomingDistances)
+ {
+ 	return executionState.active && strcmp(executionState.mode, "native") != 0 &&
+-		(executionState.queueStatsEnabled ||
++		((executionState.queueStatsEnabled &&
++		  (strcmp(executionState.mode, "policy_agent") != 0 ||
++		   !installedPolicyV2 || installedQueueStatsRequired)) ||
+ 		 strcmp(executionState.traceLevel, "checkpoints") == 0) &&
+ 		executionState.distanceEvaluations + upcomingDistances >=
+ 		executionState.nextCheckpointTarget;

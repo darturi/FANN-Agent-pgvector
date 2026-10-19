@@ -1,5 +1,16 @@
 # Unreleased
 
+- Preserve the tested Reviews entry-distance getter and demand-based queue snapshot
+  gate in the packaged engine recipe.
+- Skip frontier sorting when percentile collection and checkpoint tracing are off;
+  retain the original mean/variance reduction order and traced percentile values.
+- Add frontier snapshot volume, maximum size, sort count and collection-phase timers
+  to completion telemetry, without changing policy features or checkpoint scheduling.
+- Add compiled C equivalence tests and a disposable native synthetic A/B fixture with
+  numeric statistics, adjacent-float stopping thresholds and physical-index checks.
+- Keep historical qualification separate from this patch's local validation. No new
+  x86 Torch or broad deployment-performance claim is made.
+
 Supply an installed configuration template and read-only installation diagnostics,
 including Docker filesystem capacity. Trusted controller containers join the
 run-owned relay ingress network and use a launch-local endpoint while saved host

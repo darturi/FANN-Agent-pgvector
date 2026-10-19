@@ -17,7 +17,9 @@ for patch in \
   "${engine_dir}/patches/0001-same-execution-observability.patch" \
   "${engine_dir}/patches/0002-paper-informed-evidence.patch" \
   "${engine_dir}/patches/0003-close-remaining-gaps.patch" \
-  "${engine_dir}/patches/0004-existing-target-binding.patch"; do
+  "${engine_dir}/patches/0004-existing-target-binding.patch" \
+  "${engine_dir}/patches/0005-reviews-runtime-fixes.patch" \
+  "${engine_dir}/patches/0006-demand-frontier-statistics.patch"; do
   git -C "${checkout}" apply --check "${patch}"
   git -C "${checkout}" apply "${patch}"
 done

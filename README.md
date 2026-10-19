@@ -103,3 +103,27 @@ and account for Docker internal networks'
 [gateway/host access](https://docs.docker.com/reference/cli/docker/network/create/#network-internal-mode---internal).
 
 Native ARM64 qualification is recorded in `QUALIFICATION.md`. AMD64, public publication, paid-model smoke tests and broader engine/data qualification remain separate gates. This package makes no new performance claim.
+
+### Frontier statistics collection
+
+The current recipe also includes the Reviews demand-collection fix and a new
+frontier collector optimization. With percentile collection disabled and tracing
+off, minimum/maximum use a linear scan and mean/variance keep the original two-pass
+calculation order. Sorting is retained when `queue_quantiles` is enabled or a
+checkpoint trace needs percentile values. Numeric mean and variance policies still
+compute their values; availability checks are not substituted for numeric statistics.
+Checkpoint placement, the feature registry and the bounded policy language are unchanged.
+
+Completion telemetry adds `frontier_snapshot_count`, `frontier_values_copied`,
+`frontier_maximum_count`, `frontier_traversal_ns`, `frontier_statistics_ns`,
+`frontier_sort_count`, `frontier_sort_ns` and `frontier_quantile_ns`. Snapshot counts
+include active empty snapshot attempts. The phase timers cover traversal/copy,
+arithmetic, sorting and percentile interpolation; their sum can be smaller than
+`feature_collection_ns`, which also includes other collection work and bookkeeping.
+These diagnostics are not policy features and do not change the registry identity.
+
+`tests/test_frontier_statistics.py` compiles the actual packaged collector and its
+baseline, checking bitwise feature equivalence and adjacent-float threshold decisions.
+The explicit native fixture in `tests/fixtures/queue_statistics.py` runs both libraries
+against the same disposable synthetic index. Its local ARM observations do not
+establish a Reviews/Torch speedup. An x86 Torch A/B experiment remains to be run.
