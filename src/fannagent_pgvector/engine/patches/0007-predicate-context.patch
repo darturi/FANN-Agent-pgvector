@@ -1,0 +1,77 @@
+--- a/src/fannbench.c
++++ b/src/fannbench.c
+@@ -109,6 +109,8 @@
+ 	int64		fixedBudget;
+ 	int32		requestedK;
+ 	int32		predicateLeafCount;
++	int64		queryPredicateThreshold;
++	bool		queryContextEnabled;
+ 	int32		returnedCount;
+ 	bool		hnswReached;
+ 	int64		distanceEvaluations;
+@@ -606,6 +608,9 @@
+ 					 executionState.queuePops,
+ 					 executionState.adjacencyEntriesExamined,
+ 					 executionState.frontierCount);
++	if (executionState.queryContextEnabled)
++		appendStringInfo(&line, ",\"query_predicate_threshold\":" INT64_FORMAT,
++					 executionState.queryPredicateThreshold);
+ 	if (executionState.executorTuplePassCount + executionState.executorTupleFailCount > 0)
+ 		appendStringInfo(&line,
+ 					 ",\"executor_tuple_pass_count\":" INT64_FORMAT
+@@ -707,7 +712,7 @@
+ KnownFeature(const char *name)
+ {
+ 	static const char *features[] = {
+-		"k", "predicate_leaf_count", "checkpoint_index",
++		"k", "predicate_leaf_count", "query_predicate_threshold", "checkpoint_index",
+ 		"distance_evaluations", "distance_evaluations_since_checkpoint",
+ 		"unique_discoveries", "completed_expansions", "qualified_candidate_count",
+ 		"best_qualified_distance", "worst_qualified_top_k_distance",
+@@ -996,7 +1001,9 @@
+ 	CopyTextArgument(PG_GETARG_TEXT_PP(10), groups, sizeof(groups), "feature groups");
+ 	for (group = strtok(groups, ","); group != NULL; group = strtok(NULL, ","))
+ 	{
+-		if (strcmp(group, "queue") == 0)
++		if (strcmp(group, "query_context") == 0)
++			executionState.queryContextEnabled = true;
++		else if (strcmp(group, "queue") == 0)
+ 			executionState.queueStatsEnabled = true;
+ 		else if (strcmp(group, "queue_quantiles") == 0)
+ 		{
+@@ -1004,6 +1011,20 @@
+ 			executionState.queueQuantilesEnabled = true;
+ 		}
+ 	}
++	/* This opt-in value is a request constant, never inferred from identities or
++	 * from executor feedback. ResetExecutionState clears it on every request. */
++	if (executionState.queryContextEnabled)
++	{
++		if (PG_NARGS() != 13 || PG_ARGISNULL(12))
++			ereport(ERROR, (errmsg("query_context requires an explicit predicate threshold")));
++		executionState.queryPredicateThreshold = PG_GETARG_INT64(12);
++		if (executionState.queryPredicateThreshold < 0 ||
++			executionState.predicateLeafCount > 1 ||
++			(executionState.predicateLeafCount == 0 && executionState.queryPredicateThreshold != 0))
++			ereport(ERROR, (errmsg("invalid predicate-context-v1 binding")));
++	}
++	else if (PG_NARGS() > 12)
++		ereport(ERROR, (errmsg("predicate threshold requires query_context group")));
+ 	if (strcmp(executionState.traceLevel, "off") != 0)
+ 	{
+ 		char directory[MAXPGPATH];
+@@ -1069,6 +1090,14 @@
+ 	{
+ 		value.type = FANNBENCH_VALUE_INT;
+ 		value.intValue = features->predicateLeafCount;
++	}
++	else if (strcmp(name, "query_predicate_threshold") == 0)
++	{
++		if (executionState.queryContextEnabled)
++		{
++			value.type = FANNBENCH_VALUE_INT;
++			value.intValue = executionState.queryPredicateThreshold;
++		}
+ 	}
+ 	else if (strcmp(name, "checkpoint_index") == 0)
+ 	{

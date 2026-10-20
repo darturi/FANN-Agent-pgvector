@@ -15,15 +15,18 @@ from .context import ExecutionContext
 from .features import (
     ENGINE_CAPABILITIES,
     FEATURE_PROFILE,
-    FEATURE_REGISTRY_HASH,
-    FEATURES,
     AvailabilityReason,
+    registry_for,
 )
+from .query_context import predicate_threshold
 from .trace import CheckpointRecord, ExecutionTrace, TraceFeature
 
 
 def feature_set_hash(groups: list[str]) -> str:
-    return stable_hash({"profile": FEATURE_PROFILE, "groups": sorted(groups)})
+    profile = (
+        FEATURE_PROFILE + "/predicate-context-v1" if "query_context" in groups else FEATURE_PROFILE
+    )
+    return stable_hash({"profile": profile, "groups": sorted(groups)})
 
 
 def normalize_engine_trace(
@@ -40,9 +43,10 @@ def normalize_engine_trace(
     index_parameters: dict[str, Any] | None = None,
     completion: dict[str, Any] | None = None,
 ) -> ExecutionTrace:
+    registry_hash, definitions = registry_for(context.feature_groups)
     if descriptor.get("file") != f"{nonce}.jsonl":
         raise ValidationError("engine trace filename does not match the request nonce")
-    if descriptor.get("feature_registry_hash") != FEATURE_REGISTRY_HASH:
+    if descriptor.get("feature_registry_hash") != registry_hash:
         raise ValidationError("engine trace registry hash mismatch")
     expected_set = feature_set_hash(context.feature_groups)
     if descriptor.get("feature_set_hash") != expected_set:
@@ -68,7 +72,7 @@ def normalize_engine_trace(
             previous_sequence = sequence
             if record.get("request_nonce", nonce) != nonce:
                 raise ValueError("event request nonce mismatch")
-            if record.get("feature_registry_hash", FEATURE_REGISTRY_HASH) != FEATURE_REGISTRY_HASH:
+            if record.get("feature_registry_hash", registry_hash) != registry_hash:
                 raise ValueError("event feature registry mismatch")
             if record["type"] == "checkpoint":
                 if terminal is not None:
@@ -76,12 +80,20 @@ def normalize_engine_trace(
                 raw_features = record["features"]
                 if not isinstance(raw_features, dict):
                     raise ValueError("checkpoint features must be an object")
+                if "query_context" in context.feature_groups:
+                    value = raw_features.get("query_predicate_threshold")
+                    if type(value) is not int or value != predicate_threshold(query.model_dump()):
+                        raise ValueError(
+                            "native predicate threshold disagrees with the actual query"
+                        )
                 raw_availability = record.get("availability", {})
                 if not isinstance(raw_availability, dict):
                     raise ValueError("availability reasons must be an object")
                 available: dict[str, TraceFeature] = {}
                 supported = set(ENGINE_CAPABILITIES[backend]["checkpoint_fields"])
-                for name, definition in FEATURES.items():
+                if "query_context" in context.feature_groups:
+                    supported.add("query_predicate_threshold")
+                for name, definition in definitions.items():
                     if definition.stage != "runtime":
                         continue
                     if name in raw_features:
@@ -196,7 +208,7 @@ def normalize_engine_trace(
             "type": "terminal",
             "sequence": previous_sequence + 1,
             "request_nonce": nonce,
-            "feature_registry_hash": FEATURE_REGISTRY_HASH,
+            "feature_registry_hash": registry_hash,
             "component_id": "request",
             "trace_truncated": True,
             "missing_due_to_truncation": True,
@@ -204,6 +216,7 @@ def normalize_engine_trace(
             **(completion or {}),
         }
     return ExecutionTrace(
+        feature_registry_hash=registry_hash,
         backend=backend,
         query_id=query.id,
         query_hash=stable_hash(query.model_dump(mode="json")),

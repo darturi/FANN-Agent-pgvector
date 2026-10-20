@@ -39,6 +39,10 @@
     {
       "path": "patches/0006-demand-frontier-statistics.patch",
       "sha256": "d40a2db61888b1447f0f4a515e6eb598d5b0777a0794bea926c8606660694710"
+    },
+    {
+      "path": "patches/0007-predicate-context.patch",
+      "sha256": "12c95aa39b1addd102010054582bfe8daacd6ded9a3dc7cc8d2562e632186f07"
     }
   ],
   "unverified": [
@@ -122,5 +126,15 @@
       "runtime_image": "sha256:2f5c021637bf2579233d85e4a9074e6c5007c14202f113ff67a064c308e87078",
       "performance_scope": "Synthetic fixture, fixed baseline-then-optimized order; no Reviews/Torch performance claim"
     }
+  },
+  "predicate_context": {
+    "version": "predicate-context-v1",
+    "scope": "Explicit experimental adapter; legacy 12-argument ABI and default profile preserved",
+    "status": "qualified_local_synthetic_only",
+    "qualification_reference": "verification/predicate-context-v1.json",
+    "architecture": "aarch64",
+    "runtime_profile_hash": "013de92ffffa8e1d6a62d09586cb322bb0c2342b926c7e947a56a8535710ca14",
+    "registry_hash": "bc772009a952c77b3a4c3d90c69ae62cea500b6f2c71ce06128ea498a974fc8b",
+    "candidate_library_sha256": "2e261b27f3f2708d7ad351db6a1561b900602bd6fbdfc37aad22ac0fe7c8c22f"
   }
 }

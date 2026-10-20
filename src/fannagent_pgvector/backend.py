@@ -32,7 +32,7 @@ from psycopg.rows import dict_row
 from . import security
 from .docker import docker
 from .native.context import ExecutionContext
-from .native.features import ENGINE_CAPABILITIES, FEATURE_REGISTRY_HASH
+from .native.features import ENGINE_CAPABILITIES
 from .native.filters import postgres_filter
 from .native.sequential import begin_execution_batch, complete_execution_batch
 from .native.transport import feature_set_hash, normalize_engine_trace
@@ -97,6 +97,10 @@ def uses_index(plan):
 
 
 class NativeBackend:
+    runtime_profile = PROFILE
+    functions = FUNCTIONS
+    checkpoint_fields = tuple(ENGINE_CAPABILITIES["pgvector"]["checkpoint_fields"])
+
     def __init__(self, config, store):
         self.config, self.store = config, store
         self.conn = None
@@ -104,7 +108,7 @@ class NativeBackend:
         self._installed = None
         self._inspection = None
         self._operation_lock = threading.RLock()
-        self._policies = PreparedPolicyCache(PROFILE)
+        self._policies = PreparedPolicyCache(self.runtime_profile)
         self._binding = None
         self._binding_conn = None
         self._compatibility_error = False
@@ -316,7 +320,7 @@ class NativeBackend:
             True,
             True,
             ("physical_backup", "pg_basebackup"),
-            tuple(ENGINE_CAPABILITIES["pgvector"]["checkpoint_fields"]),
+            self.checkpoint_fields,
             ("postgresql_pgvector_hnsw", "postgresql_non_hnsw"),
             (
                 "snapshot only",
@@ -330,7 +334,7 @@ class NativeBackend:
         )
 
     def validate_policy(self, raw):
-        return validate_policy(raw, PROFILE)
+        return validate_policy(raw, self.runtime_profile)
 
     def _prepare_policy(self, raw):
         with self._operation_lock:
@@ -838,7 +842,7 @@ class NativeBackend:
                         raise AgentError("secured copy authentication rules are invalid")
                     if conn.execute("SHOW hba_file").fetchone()[0] != security.HBA_PATH:
                         raise AgentError("secured copy authentication file was overridden")
-                    conn.execute(FUNCTIONS)
+                    conn.execute(self.functions)
                 break
             except psycopg.OperationalError:
                 for name in (container, proxy):
@@ -1075,11 +1079,24 @@ class NativeBackend:
             )
         )
 
-    def _execute_probe(self, query, *, mode="native", policy=None, trace=False, audit=False):
+    def _bind_query_context(self, query, statement, params):
+        return statement, params
+
+    def _policy_search_batch(self, conn, policy, nonce, begin_sql, begin_params, statement, params):
+        if policy and self._installed != policy.policy_hash:
+            self._install_policy(policy)
+        ack = begin_execution_batch(conn, begin_sql, begin_params)
+        if ack != nonce:
+            raise AgentError("query nonce acknowledgement mismatch")
+        return conn.execute(statement, params).fetchall()
+
+    def _execute_probe(
+        self, query, *, mode="native", policy=None, trace=False, audit=False, _validated_query=False
+    ):
         conn = self._connect()
         started = time.perf_counter_ns()
         policy = self._prepare_policy(policy) if policy is not None else None
-        if mode == "policy":
+        if mode == "policy" and not _validated_query:
             query = self.snapshot().query(query)
         statement, params = self._statement(query)
         nonce = uuid.uuid4().hex
@@ -1096,6 +1113,11 @@ class NativeBackend:
                 "pgvector_executor",
             ]
         )
+        if (
+            "query_context" in self.runtime_profile.collection_groups
+            and "query_context" not in groups
+        ):
+            groups.append("query_context")
         context = ExecutionContext(
             mode="policy_agent" if mode == "policy" else "policy_noop",
             policy_hash=policy.policy_hash if policy else None,
@@ -1117,22 +1139,26 @@ class NativeBackend:
             predicate_leaf_count(query.get("filter")),
             context.trace_level.value,
             context.trace_max_bytes,
-            FEATURE_REGISTRY_HASH,
-            policy.group_hash if policy else feature_set_hash(groups),
-            policy.group_csv if policy else ",".join(sorted(groups)),
+            self.runtime_profile.native_registry_hash,
+            (
+                feature_set_hash(groups)
+                if not policy or len(groups) != len(policy.groups)
+                else policy.group_hash
+            ),
+            policy.group_csv
+            if policy and len(groups) == len(policy.groups)
+            else ",".join(sorted(groups)),
             audit,
         )
         begin_sql = "SELECT fannagent.begin_execution(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
-        # Select transport before sending execution commands. Installation is acknowledged
-        # separately and remains inside this call's original policy timing boundary.
+        begin_sql, begin_params = self._bind_query_context(query, begin_sql, begin_params)
+        # Select transport before sending execution commands. Each transport checks
+        # installation acknowledgements inside the original policy timing boundary.
         batched = mode != "native" and self._batch_ready(conn)
         if batched:
-            if policy and self._installed != policy.policy_hash:
-                self._install_policy(policy)
-            ack = begin_execution_batch(conn, begin_sql, begin_params)
-            if ack != nonce:
-                raise AgentError("query nonce acknowledgement mismatch")
-            rows = conn.execute(statement, params).fetchall()
+            rows = self._policy_search_batch(
+                conn, policy, nonce, begin_sql, begin_params, statement, params
+            )
             # The final batch drains completion AND commit before accepting results.
             telemetry = json.loads(complete_execution_batch(conn, nonce, len(rows)))
             decoded = [(self.snapshot().source_to_id[str(r[0])], float(r[1])) for r in rows]

@@ -19,7 +19,8 @@ for patch in \
   "${engine_dir}/patches/0003-close-remaining-gaps.patch" \
   "${engine_dir}/patches/0004-existing-target-binding.patch" \
   "${engine_dir}/patches/0005-reviews-runtime-fixes.patch" \
-  "${engine_dir}/patches/0006-demand-frontier-statistics.patch"; do
+  "${engine_dir}/patches/0006-demand-frontier-statistics.patch" \
+  "${engine_dir}/patches/0007-predicate-context.patch"; do
   git -C "${checkout}" apply --check "${patch}"
   git -C "${checkout}" apply "${patch}"
 done

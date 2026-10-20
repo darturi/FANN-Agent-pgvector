@@ -1,6 +1,12 @@
 from fannagent.api import DataProfile, FeatureDefinition, RuntimeProfile
 
-from .native.features import ENGINE_CAPABILITIES, FEATURE_REGISTRY_HASH, FEATURES
+from .native.features import (
+    CONTEXT_FEATURE,
+    CONTEXT_REGISTRY_HASH,
+    ENGINE_CAPABILITIES,
+    FEATURE_REGISTRY_HASH,
+    FEATURES,
+)
 
 DATA_PROFILE = DataProfile(
     name="pgvector_normalized_cosine_f32/v1", identifier_representation="int64"
@@ -44,4 +50,16 @@ PROFILE = RuntimeProfile(
             "else": "continue",
         },
     },
+)
+
+
+# Separately versioned ablation, matching the predeclared learning study fingerprint.
+
+PREDICATE_CONTEXT_PROFILE = PROFILE.model_copy(
+    update={
+        "name": PROFILE.name + "/predicate-context-v1",
+        "features": {**PROFILE.features, CONTEXT_FEATURE.name: CONTEXT_FEATURE},
+        "collection_groups": (*PROFILE.collection_groups, "query_context"),
+        "native_registry_hash": CONTEXT_REGISTRY_HASH,
+    }
 )

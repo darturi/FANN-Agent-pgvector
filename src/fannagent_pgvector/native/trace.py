@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from .features import FEATURE_REGISTRY_HASH, FEATURES
+from .features import CONTEXT_FEATURES, FEATURE_REGISTRY_HASH, registry_for
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,7 @@ class CheckpointRecord:
         if self.actual_layer0_distances < self.target:
             raise ValueError("checkpoint precedes its target")
         for name in self.features:
-            definition = FEATURES.get(name)
+            definition = CONTEXT_FEATURES.get(name)
             if definition is None or definition.stage != "runtime":
                 raise ValueError(f"invalid runtime trace feature: {name}")
 
@@ -71,10 +71,13 @@ class ExecutionTrace:
     index_instance_id: str | None = None
 
     def __post_init__(self) -> None:
-        if self.feature_registry_hash != FEATURE_REGISTRY_HASH:
+        expected_registry, definitions = registry_for(self.feature_groups)
+        if self.feature_registry_hash != expected_registry:
             raise ValueError("trace feature registry hash mismatch")
         if not self.nonce or not self.dataset_hash or not self.index_hash:
             raise ValueError("trace is missing execution identity")
+        if any(set(c.features).difference(definitions) for c in self.checkpoints):
+            raise ValueError("trace feature is outside its selected registry")
         previous = 0
         previous_target = 0
         previous_actual = 0

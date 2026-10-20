@@ -127,3 +127,11 @@ baseline, checking bitwise feature equivalence and adjacent-float threshold deci
 The explicit native fixture in `tests/fixtures/queue_statistics.py` runs both libraries
 against the same disposable synthetic index. Its local ARM observations do not
 establish a Reviews/Torch speedup. An x86 Torch A/B experiment remains to be run.
+
+The experimental, separately versioned native predicate-context getter and its
+qualification scope are documented in [PREDICATE_CONTEXT.md](docs/PREDICATE_CONTEXT.md).
+
+The opt-in prepared execution, fused transport and query-level native bypass
+are documented in [insertion-bypass.md](docs/insertion-bypass.md). The next Torch
+package measures these paths against the frozen driver under the same per-filter
+recall criteria; the registered default adapter is unchanged.

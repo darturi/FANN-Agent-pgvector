@@ -1,0 +1,42 @@
+{
+  "status": "qualified_local_synthetic_only",
+  "architecture": "aarch64",
+  "synthetic_rows": 4000,
+  "dimensions": 16,
+  "cases": 20,
+  "equivalence_comparisons": 40,
+  "true_false_branches": 40,
+  "baseline_library_sha256": "c058c641c1698746984eaf21f35850ec4a72d31684b5dd3863a5bd020619397a",
+  "candidate_library_sha256": "2e261b27f3f2708d7ad351db6a1561b900602bd6fbdfc37aad22ac0fe7c8c22f",
+  "runtime_profile_hash": "013de92ffffa8e1d6a62d09586cb322bb0c2342b926c7e947a56a8535710ca14",
+  "registry_hash": "bc772009a952c77b3a4c3d90c69ae62cea500b6f2c71ce06128ea498a974fc8b",
+  "timing_pairs": 180,
+  "mean_reported_delta_ms": 0.40249935000000003,
+  "mean_outer_delta_ms": 0.4368513333333333,
+  "checks": [
+    "legacy cross-binary IDs distances work and trajectory",
+    "context trajectory and results unchanged",
+    "native true/false getter branches",
+    "int64 bounds",
+    "unfiltered and zero distinction",
+    "same-session disabled getter unavailable",
+    "rollback reset",
+    "invalid binding rejection",
+    "same physical index"
+  ],
+  "Reviews_queries": 0,
+  "provider_calls": 0,
+  "scope": "local synthetic ARM only; Torch performance and deployment unqualified",
+  "extension_tests": {
+    "passed": 128,
+    "integration_tests_not_run": 10
+  },
+  "patch_sha256": "12c95aa39b1addd102010054582bfe8daacd6ded9a3dc7cc8d2562e632186f07",
+  "native_fixture_sha256": "7f82d927023c1a140190ac4fead72d6e15005c576d528d344971d6129662cc51",
+  "not_yet_qualified": [
+    "x86_64 native execution",
+    "Torch Reviews overhead",
+    "full copy/deployment",
+    "context-using learned policies"
+  ]
+}
