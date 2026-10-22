@@ -1,6 +1,33 @@
 # FANNAgent pgvector extension
 
-The core's [installation bundle](../agent/packaging/README.md) supplies host and
+Companion source for [FANNAgent](https://github.com/darturi/FANN-Agent/tree/portfolio-v1),
+implemented by Daniel Arturi (darturi). This portfolio snapshot retains runtime
+source from commit `09590fd`; publication adds documentation and MIT licensing.
+The [engine notice](src/fannagent_pgvector/engine/NOTICE.md) and bundled license
+notices preserve upstream PostgreSQL, pgvector, and instrumentation credit.
+
+## Source installation
+
+Clone the two tagged repositories as siblings named `agent` and `agent-pgvector`:
+
+```sh
+git clone --branch portfolio-v1 --single-branch https://github.com/darturi/FANN-Agent.git agent
+git clone --branch portfolio-v1 --single-branch https://github.com/darturi/FANN-Agent-pgvector.git agent-pgvector
+cd agent-pgvector
+uv sync --frozen --extra dev --python 3.12
+uv run --frozen fannagent backends list
+```
+
+The core's scripted demo requires only the core repository. Database-backed use
+requires the prepared source, Docker, instrumented images, and qualification
+conditions below. This source publication does not establish new native or
+performance qualification. See [QUALIFICATION.md](QUALIFICATION.md) for historical
+ARM64 checks and their limits. Licensed under [MIT](LICENSE); upstream components
+retain the notices shipped with the engine sources.
+
+## Database workflow reference
+
+The core's [installation bundle](https://github.com/darturi/FANN-Agent/blob/portfolio-v1/packaging/README.md) supplies host and
 container launchers. `fannagent init --backend pgvector --output pgvector.yaml`
 creates a packaged template, and `fannagent doctor pgvector.yaml --check-source`
 performs source inspection and installation checks without creating a study.
@@ -8,7 +35,7 @@ In container mode the trusted controller joins the owned relay ingress network;
 saved host credentials and frozen policy identities remain unchanged. Source DSNs
 must be reachable from the controller, and replication DSNs from the backup helper.
 
-Install with `pip install fannagent fannagent-pgvector`. See the core's extension API documentation for the package boundary. This package owns PostgreSQL configuration, physical copy preparation, native telemetry, exact truth, policy sessions, and cleanup.
+For the source installation above, use the locked sibling checkouts. Public package-registry availability is not assumed. See the core's extension API documentation for the package boundary. This package owns PostgreSQL configuration, physical copy preparation, native telemetry, exact truth, policy sessions, and cleanup.
 
 Build the pinned instrumented image from an installed distribution using `fannagent-pgvector-build`. This builds PostgreSQL 17.11 and pgvector 0.8.6 from pinned upstream commits and the packaged patches. No harness checkout or harness base image is required.
 
@@ -102,7 +129,7 @@ Security controls follow PostgreSQL's
 and account for Docker internal networks'
 [gateway/host access](https://docs.docker.com/reference/cli/docker/network/create/#network-internal-mode---internal).
 
-Native ARM64 qualification is recorded in `QUALIFICATION.md`. AMD64, public publication, paid-model smoke tests and broader engine/data qualification remain separate gates. This package makes no new performance claim.
+Native ARM64 qualification is recorded in `QUALIFICATION.md`. This repository publishes the companion source snapshot; public package/image publication, AMD64 qualification, paid-model smoke tests, and broader engine/data qualification remain separate gates. This package makes no new performance claim.
 
 ### Frontier statistics collection
 
